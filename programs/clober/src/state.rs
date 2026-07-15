@@ -359,12 +359,6 @@ pub struct MarketAccount {
     /// field within `space()` headroom: pre-existing accounts deserialize it
     /// as 0, so the first real fill (`fill_seq` ≥ 1) passes.
     pub last_settlement_seq: u64,
-    /// Sticky flag: once `init_fill_commitment` arms this market, the
-    /// fill-commitment ring is MANDATORY in `apply_fill` — a (compromised)
-    /// sequencer cannot bypass the anti-fabrication guard by omitting the
-    /// optional ring account. Never cleared. Trailing field: accounts
-    /// serialized before it existed deserialize it as `false`.
-    pub fill_commitment_required: bool,
     /// Sticky flag: once `initialize_haircut_state` enables the haircut
     /// junior-claim engine for this market, the (optional) haircut accounts
     /// are MANDATORY in `apply_fill`/`apply_lp_fill`. Without this a
@@ -410,7 +404,7 @@ pub struct MarketAccount {
     /// cross in one `place_taker_order` tx. Trailing field
     /// (`size_of::<MarketAccount>()` is 896 B with 256 B free under
     /// `space() = 1152`; pre-existing accounts deserialize it as `0`). `0`
-    /// means the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the log-safe
+    /// means the global `MAX_MATCH_BATCH_ORDERS` (96) — the log-safe
     /// default. Raised (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`,
     /// which simultaneously arms the on-chain fill-outbox so the crossed
     /// fills are delivered OFF the program log: a cap above the ~96 log-safe
@@ -490,7 +484,7 @@ pub struct MarketAccount {
     /// `apply_lp_fill` auto-PAUSE the market (a flag write — the committed fill
     /// still settles; only NEW intake is blocked, which the intake gate already
     /// rejects on `Paused`). `0 = DISABLED` — the default, so this is opt-in per
-    /// market and legacy accounts (which read this trailing field as 0) are
+    /// market and default accounts (which read this trailing field as 0) are
     /// byte-for-byte unaffected. Set via `set_oi_insurance_multiple_bps`.
     pub oi_insurance_multiple_bps: u64,
     /// Bootstrap floor for the OI-vs-insurance breaker (above): the absolute GROSS
@@ -502,7 +496,7 @@ pub struct MarketAccount {
     /// the floor is what makes the breaker safely enable-able at launch. Because the
     /// cap is the MAX of the two terms, a floor only ever RAISES the ceiling — it can
     /// never trip the breaker more often than the floorless version. `0 = no floor`
-    /// (pure insurance-scaled), the legacy behaviour. Trailing field ⇒ pre-existing
+    /// (pure insurance-scaled), the default behaviour. Trailing field ⇒ pre-existing
     /// accounts (zero-padded to `space()`) read it as 0 — byte-for-byte unaffected.
     /// Bounded by `MAX_OI_INSURANCE_FLOOR_NOTIONAL`; set via
     /// `set_oi_insurance_floor_notional`.
@@ -513,8 +507,8 @@ pub struct MarketAccount {
     /// (`scale_shock`), so a lower-vol asset is stress-tested to a smaller move
     /// and can carry higher leverage. The maintenance floor is tied to this via
     /// `hip3_core_bounds_ok` so a position is liquidatable exactly when a
-    /// worst-shock move would breach it. `0` ⇒ legacy ±30% (full lattice +
-    /// legacy 5% MM floor) — the safe default and off-switch. Trailing field ⇒
+    /// worst-shock move would breach it. `0` ⇒ default ±30% (full lattice +
+    /// default 5% MM floor) — the safe default and off-switch. Trailing field ⇒
     /// pre-existing accounts (zero-padded to `space()`) read it as 0. Set via
     /// `set_market_stress_tier`; a nonzero value must be ≥ `MIN_STRESS_SHOCK_BPS`.
     pub stress_shock_bps: u32,
@@ -523,8 +517,8 @@ pub struct MarketAccount {
     /// underwrites, distinct from the (smaller) margin tier above. The backstop
     /// gate requires `insurance ≥ OI_cap × max(0, tail − MM) / BPS`, so leverage
     /// can never outrun what the fund can absorb on a tail gap PAST maintenance.
-    /// The setter enforces `tail ≥ max(LEGACY_STRESS_SHOCK_BPS, stress_shock)`,
-    /// so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ legacy 30% tail.
+    /// The setter enforces `tail ≥ max(BASELINE_STRESS_SHOCK_BPS, stress_shock)`,
+    /// so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ default 30% tail.
     /// Trailing field ⇒ pre-existing accounts read it as 0.
     pub backstop_tail_bps: u32,
 
@@ -541,7 +535,7 @@ pub struct MarketAccount {
     /// Phase 3 cross-asset offset credit — correlation group id. Positions in
     /// markets sharing a non-zero group id net their opposing worst-case losses
     /// by the group's correlation `corr_rho_bps`. `0` ⇒ market is in NO group ⇒
-    /// no offset (fully decorrelated, byte-identical to legacy). Trailing field
+    /// no offset (fully decorrelated, byte-identical to default). Trailing field
     /// within `space()` headroom; pre-existing accounts read it as 0.
     pub corr_group_id: u16,
     /// Phase 3 — this market's correlation with its group, in bps (`0..=BPS`).
@@ -627,34 +621,34 @@ impl MarketAccount {
     pub const SEED: &'static [u8] = b"market";
 
     /// Effective per-market stress shock (bps) for the margin lattice. `0`
-    /// (never tiered / legacy account) ⇒ the legacy ±30% black swan, so an
+    /// (never tiered / default account) ⇒ the default ±30% black swan, so an
     /// un-tiered market is stress-tested at full strength (fail-safe) and only
     /// an explicit tier can LOWER the required margin.
     pub fn effective_stress_shock_bps(&self) -> u32 {
         if self.stress_shock_bps == 0 {
-            crate::constants::LEGACY_STRESS_SHOCK_BPS
+            crate::constants::BASELINE_STRESS_SHOCK_BPS
         } else {
             self.stress_shock_bps
         }
     }
 
     /// Effective per-market backstop tail (bps) the insurance fund underwrites.
-    /// `0` ⇒ the legacy 30% tail.
+    /// `0` ⇒ the default 30% tail.
     pub fn effective_backstop_tail_bps(&self) -> u32 {
         if self.backstop_tail_bps == 0 {
-            crate::constants::LEGACY_STRESS_SHOCK_BPS
+            crate::constants::BASELINE_STRESS_SHOCK_BPS
         } else {
             self.backstop_tail_bps
         }
     }
     /// Effective matcher batch cap. `max_batch_orders` if a market has opted into
     /// a raised cap (always paired with an armed fill-outbox), else the global
-    /// log-safe default `MAX_BATCH_ORDERS_PER_SIDE_V2`. `0` (unset) ⇒
+    /// log-safe default `MAX_MATCH_BATCH_ORDERS`. `0` (unset) ⇒
     /// default. Clamped to `FILL_RING_CAP` so a corrupt field can never exceed the
     /// commitment-ring / outbox capacity.
     pub fn effective_batch_cap(&self) -> usize {
         let cap = if self.max_batch_orders == 0 {
-            crate::MAX_BATCH_ORDERS_PER_SIDE_V2
+            crate::MAX_MATCH_BATCH_ORDERS
         } else {
             self.max_batch_orders as usize
         };
@@ -1036,7 +1030,7 @@ impl LpPositionAccount {
 }
 
 /// Protocol-wide LP-system lock. The singleton `LiquidityPoolAccount`
-/// (`apply_lp_fill` books every LP fill into it) and the per-market v3 LP
+/// (`apply_lp_fill` books every LP fill into it) and the per-market LP system
 /// redeem from the SAME vault, so LP shares outstanding in both would
 /// double-count the same realized PnL and let the last redeemers over-withdraw.
 /// This singleton records which system minted shares first; the other system's
@@ -1047,7 +1041,7 @@ impl LpPositionAccount {
 #[derive(Debug)]
 pub struct LpModeAccount {
     pub bump: u8,
-    /// 0 = unset, 1 = singleton, 2 = per-market v3.
+    /// 0 = unset, 1 = singleton, 2 = per-market.
     pub mode: u8,
     pub _reserved: [u8; 6],
 }
@@ -1055,7 +1049,7 @@ impl LpModeAccount {
     pub const SEED: &'static [u8] = b"lp_mode";
     pub const MODE_UNSET: u8 = 0;
     pub const MODE_SINGLETON: u8 = 1;
-    pub const MODE_V3: u8 = 2;
+    pub const MODE_PER_MARKET: u8 = 2;
     pub fn space() -> usize {
         8 + 8
     }

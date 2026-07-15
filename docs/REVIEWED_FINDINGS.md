@@ -27,7 +27,7 @@ code stands as-is.
   path regardless), and closing it fully requires an L1-slot-high-water-mark
   redesign. It is the documented single-sequencer residual, not a separate bug.
 
-- **The intake initial-margin gate is not applied on the v3 injection paths**
+- **The intake initial-margin gate is not applied on the order injection paths**
   (TWAP slice / iceberg / bracket / entry-trigger). The gate is intake-only and
   advisory — the position opens at settlement regardless — and these paths sit
   on the matching hot path. It is a real gap but low-value; if ever applied it

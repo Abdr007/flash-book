@@ -1,4 +1,4 @@
-// HLP increment 2 LIVE acceptance: the pool auto-quotes.
+// Liquidity-pool live acceptance: the pool auto-quotes.
 //   1. fresh armed market (LOW oracle so the ~8M global LP capital yields
 //      non-zero per-level size) + book + ring
 //   2. lp_refresh_quotes -> the pool posts a deterministic two-sided ladder
@@ -35,7 +35,7 @@ const send = async (ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`HLP increment-2 (auto-quoter) live acceptance — L1=${L1_RPC}\n`);
+console.log(`liquidity pool increment-2 (auto-quoter) live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const ORACLE = 1000; // low so the ~8M global LP capital yields non-zero levels
@@ -57,7 +57,7 @@ const sig1 = await send(await program.methods.lpRefreshQuotes().accountsPartial(
 ok(!!sig1, `pool posted its on-book quote ladder LIVE — ${sig1.slice(0, 16)}…`);
 
 console.log("2) taker crosses the pool's best ask (bid 10× oracle to guarantee a cross)");
-await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(ORACLE * 10), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await send(await program.methods.placeTakerOrder(0, new BN(1), new BN(ORACLE * 10), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 const r = await ring();
 ok(r.produced >= 1, `a taker crossed an AUTO-QUOTED LP level → ring-committed LP-maker fill (produced=${r.produced})`);
 
@@ -68,5 +68,5 @@ await new Promise((r) => setTimeout(r, 25_000));
 const sig3 = await send(await program.methods.lpRefreshQuotes().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, lpExposure: LP }).instruction());
 ok(!!sig3, `pool re-quoted (cancel stale + repost) LIVE — ${sig3.slice(0, 16)}…`);
 
-console.log(`\n${fail === 0 ? "✅ HLP AUTO-QUOTER LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ liquidity pool AUTO-QUOTER LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

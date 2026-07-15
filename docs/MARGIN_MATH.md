@@ -90,7 +90,7 @@ mmr_concentration(s, m) = mmr_m  +  (extra_m  if  s ≥ thresh_m  else  0)
 `extra_m = market.params.concentration_extra_mmr_bps`
 `thresh_m = market.params.concentration_threshold_lots`
 
-`thresh_m == 0` disables the tier (legacy single-MMR behaviour).
+`thresh_m == 0` disables the tier (baseline single-MMR behaviour).
 
 ### 2.2 Tiered MMR (Hyperliquid-style)
 
@@ -244,7 +244,7 @@ locks in the second.
 
 ---
 
-## 6. Liquidation routing (`liquidate_position_v2`)
+## 6. Liquidation routing (`liquidate_position`)
 
 ### 6.1 Health gate
 
@@ -410,7 +410,7 @@ is covered by 11 unit tests in `mod realized_pnl_routing_tests`.
 If a loss exceeds the per-position isolated bucket, we deliberately
 saturate at 0 rather than bleed into the cross pool. The unpaid
 shortfall is recovered through the standard liquidation flow:
-`liquidate_position_v2` reads `position.collateral_quote_lots` (now
+`liquidate_position` reads `position.collateral_quote_lots` (now
 0), the stress lattice marks the position unhealthy, and the
 synthetic close + insurance fund + ADL waterfall absorbs the
 remainder. This keeps the I-3 "cross-pool insulation" invariant (§9)
@@ -421,8 +421,8 @@ fill path.
 #### Why cross losses error instead of saturating
 
 The cross-collateral path uses `checked_sub`. In principle the
-pre-fill margin check at `place_limit_order_v2` /
-`place_taker_order_v2` should have prevented the trader from taking a
+pre-fill margin check at `place_limit_order` /
+`place_taker_order` should have prevented the trader from taking a
 fill they couldn't afford. If we ever reach a cross loss > pooled
 collateral here, something else has gone wrong (a stale-mark
 exploit, a bug in the margin gate); failing the fill is safer than
@@ -466,7 +466,7 @@ underwater isolated → position.collateral_quote_lots is debited
                       by the insurance fund + ADL waterfall as before;
                       the cross pool is NEVER touched, preserving I-3)
 underwater cross    → trader_state.collateral_quote_lots is debited
-                      (saturating_sub, same as legacy ADL behaviour)
+                      (saturating_sub, same as baseline ADL behaviour)
 
 counter isolated    → position.collateral_quote_lots is credited
                       (checked_add; overflow → ArithmeticOverflow)
@@ -527,8 +527,8 @@ For any trader `T`:
 |---|-----------|-------------|
 | I-1 | Cross health: `assess_margin(𝒫_cross, C_T, 𝒮).is_healthy` | All trade-path call sites via `assess_margin_unified` |
 | I-2 | Isolated independence: each `P_m ∈ 𝒫_iso` is healthy against `c_m` alone | `assess_margin_split` (5.2) |
-| I-3 | Cross pool insulation: liquidation of an isolated position never debits `C_T` | `liquidate_position_v2` (6.3) |
-| I-4 | Isolated bucket insulation: cross-path liquidation never debits any `c_m` | `liquidate_position_v2` (6.3) — cross branch never references `c_m` |
+| I-3 | Cross pool insulation: liquidation of an isolated position never debits `C_T` | `liquidate_position` (6.3) |
+| I-4 | Isolated bucket insulation: cross-path liquidation never debits any `c_m` | `liquidate_position` (6.3) — cross branch never references `c_m` |
 | I-5 | Funding insulation: funding owed/received on an isolated position never touches `C_T` | `settle_funding` (7) |
 | I-6 | Phase 2 single-isolated cap: at most one position per trader has `c_m > 0` | `set_position_isolated` rejects when a sibling already has `c_m > 0` |
 | I-7 | Cash conservation on transition: `set_position_isolated(amount)` decreases `C_T` by `amount` and increases `c_m` by `amount` (atomic, no intermediate observable state) | `set_position_isolated` handler |
@@ -543,7 +543,7 @@ Tests covering these invariants:
   the Phase 2 punch list).
 - Integration tests in `tests/integration.rs` cover the on-chain
   side of `deposit_collateral`, `withdraw_collateral`,
-  `liquidate_position_v2`, and now exercise the unified dispatch
+  `liquidate_position`, and now exercise the unified dispatch
   via the existing happy paths.
 
 ## 10. Versioning
@@ -557,34 +557,7 @@ numbered sections and the invariant table in §9.
 
 ## 11. Phase 2c — Position PDA migration
 
-The Phase 2c follow-up commit migrated Position PDAs from being keyed
-on the trader's wallet to being keyed on the trader_state PDA:
-
-```
-Pre-2c   : [POS_SEED, market.key(), wallet.key()]
-Post-2c  : [POS_SEED, market.key(), trader_state.key()]
-```
-
-This is the foundation for sub-account trading (Phase 2d): each
-TraderStateAccount — main or sub — now has its own distinct
-PositionAccount per market. Pre-2c, main and sub would have aliased
-onto the same position, defeating risk isolation.
-
-Migration is provided as a one-shot per (wallet, market) ix:
-`migrate_position_to_trader_state_key`. It reads the legacy position,
-init's a new position at the trader_state-keyed address with the same
-on-chain state (size, side, entry, funding indices, realized PnL,
-isolated collateral, timing fields), closes the legacy position, and
-refunds rent to the trader. The new account is `init` (not
-`init_if_needed`) so a second migration attempt against an existing
-new position fails — protects against accidental double-migration.
-
-`docs/ARCHITECTURE.md` covers the architectural rationale and
-the remaining Phase 2d/2e work (RestingOrderV2 schema + matcher fill
-routing) required for sub-accounts to PLACE orders rather than just
-hold collateral.
-
-The PDA change does NOT alter any margin-math invariants in §1–§9 of
-this document. Position seeds are an account-derivation concern; the
-risk model operates on PositionSnapshots which carry the same data
-fields regardless of where the on-chain position lives.
+Every position PDA is keyed by `(market, trader_state)`. Main and sub-accounts
+therefore maintain independent positions and collateral controls. Position
+derivation does not alter the margin invariants in this document: risk operates
+on `PositionSnapshot` values, not PDA addresses.

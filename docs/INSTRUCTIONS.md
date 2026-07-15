@@ -1,6 +1,6 @@
 # Instruction reference
 
-The program exposes 146 Anchor instructions. `idl/clober.json` is the
+The program exposes 162 Anchor instructions. `idl/clober.json` is the
 source of truth for accounts and argument layouts; handler doc comments in
 `programs/clober/src/lib.rs` are the authoritative behavior contracts.
 This page is the grouped index.
@@ -18,7 +18,6 @@ noted).
 | `initialize_market` | protocol authority | Create a market PDA with validated params. |
 | `init_market_book` | authority | Allocate the raw order-book slab PDA. |
 | `expand_market_book` | authority | Grow the slab (drained-invariant preserved). |
-| `migrate_market_to_v3` | authority | Realloc a market account to the v3 size (bounded by the 10 MB account cap). |
 | `reseat_order_seq_counter` | authority | Reseat the order-sequence counter on an empty book (emits an event). |
 | `seed_residual` | authority | Seed the haircut residual bucket. |
 | `verify_market_invariants` | permissionless | Probe internal consistency; auto-pauses on OI drift or a stale mark. |
@@ -27,24 +26,24 @@ noted).
 
 | Instruction | Access | Purpose |
 |---|---|---|
-| `place_limit_order_v2` | trader | Rest a limit order (post-only/IOC/FOK/reduce-only/STP flags, GTT expiry, oracle-band placement gate, intake initial-margin gate). |
-| `place_taker_order_v2` | sequencer-driven matching | Walk the book, produce fills into the ring/outbox (runs on the ER). |
-| `modify_order_v2` | trader | Cancel-and-replace preserving ownership and sub-account. |
-| `cancel_order_v2` | trader | Remove a resting order. |
-| `cancel_all_v2` | trader | Flatten all of the trader's resting orders in a market. |
+| `place_limit_order` | trader | Rest a limit order (post-only/IOC/FOK/reduce-only/STP flags, GTT expiry, oracle-band placement gate, intake initial-margin gate). |
+| `place_taker_order` | sequencer-driven matching | Walk the book, produce fills into the ring/outbox (runs on the ER). |
+| `modify_order` | trader | Cancel-and-replace preserving ownership and sub-account. |
+| `cancel_order` | trader | Remove a resting order. |
+| `cancel_all` | trader | Flatten all of the trader's resting orders in a market. |
 | `reap_expired_orders` | permissionless | Reclaim expired resting orders (bounded per call). |
-| `place_basket_order_v2` / `place_basket_order_n_v2` | trader | Multi-leg orders under a joint cross-market margin gate. |
+| `place_basket_order` / `place_basket_order_n` | trader | Multi-leg orders under a joint cross-market margin gate. |
 
 ## Trigger / TWAP / iceberg / bracket
 
 | Instruction | Access | Purpose |
 |---|---|---|
-| `place_trigger_order_v3` | trader | Stop / take-profit trigger PDA (slippage cap, reduce-only, OCO-capable). |
-| `execute_trigger_order_v3` | permissionless | Fire a triggered order into the book at a fresh, gated oracle price. |
-| `cancel_trigger_order_v3` | trader | Close a trigger PDA. |
-| `place_twap_order_v3` / `execute_twap_slice_v3` / `cancel_twap_order_v3` | trader / permissionless / trader | Sliced execution over time with slippage caps. |
-| `place_iceberg_order_v3` / `replenish_iceberg_v3` / `cancel_iceberg_v3` | trader / permissionless / trader | Hidden reservoir + visible-chunk replenishment. |
-| `place_bracket_order_v3` | trader | Atomic parent limit + two OCO-linked trigger legs. |
+| `place_trigger_order` | trader | Stop / take-profit trigger PDA (slippage cap, reduce-only, OCO-capable). |
+| `execute_trigger_order` | permissionless | Fire a triggered order into the book at a fresh, gated oracle price. |
+| `cancel_trigger_order` | trader | Close a trigger PDA. |
+| `place_twap_order` / `execute_twap_slice` / `cancel_twap_order` | trader / permissionless / trader | Sliced execution over time with slippage caps. |
+| `place_iceberg_order` / `replenish_iceberg` / `cancel_iceberg` | trader / permissionless / trader | Hidden reservoir + visible-chunk replenishment. |
+| `place_bracket_order` | trader | Atomic parent limit + two OCO-linked trigger legs. |
 
 ## Settlement & oracle
 
@@ -60,7 +59,6 @@ noted).
 | `init_market_oracle_config` / `init_lazer_oracle_config` | authority | Bind and bound the oracle sources. |
 | `gate_envelope_price_move` | permissionless probe | Prove a price move admissible under the envelope. |
 | `init_fill_commitment` / `grow_fill_commitment` | authority | Allocate / grow the settlement ring (arming is sticky; grow requires a drained ring). |
-| `upgrade_fill_commitment_v1` | authority | One-way upgrade of a drained ring to the v1 layout with reduce-in-flight tracking. |
 | `reconcile_unsettled_fill_volume` | permissionless | Reset the matched-but-unsettled OI reserve when the ring is drained. |
 | `init_fill_outbox` / `grow_fill_outbox` | authority | Allocate / grow the fill outbox (cap mirrors the ring; grow requires drained). |
 
@@ -83,7 +81,7 @@ noted).
 |---|---|---|
 | `init_book_permission` / `set_book_privacy` / `close_book_permission` | authority | Manage the TEE private-ER read allow-list (see `docs/PRIVACY.md`). |
 | `create_session_token` / `revoke_session_token` | trader | Scoped, expiring session keys (optionally market-scoped). |
-| `place_limit_order_v2_session` / `cancel_order_v2_session` / `deposit_collateral_session` | session key | Session-signed variants. |
+| `place_limit_order_session` / `cancel_order_session` / `deposit_collateral_session` | session key | Session-signed variants. |
 
 ## LP (pool)
 
@@ -93,18 +91,18 @@ noted).
 | `lp_deposit` / `lp_withdraw` | LP | NAV-share capital in/out (minimum-hold gate on exit). |
 | `lp_post_maker_order` | authority | Post a pool maker order. |
 | `lp_refresh_quotes` | permissionless (rate-limited) | Regenerate the deterministic pool quote ladder. |
-| `init_lp_per_market_v3` | protocol authority | Per-market pool exposure account. |
-| `lp_deposit_v3` / `lp_withdraw_v3` | LP | Per-market NAV-based capital (withdraw blocked while the pool has open positions against it). |
-| `record_lp_fill_v3` | sequencer | Record per-market pool exposure deltas. |
+| `init_lp_per_market` | protocol authority | Per-market pool exposure account. |
+| `lp_market_deposit` / `lp_market_withdraw` | LP | Per-market NAV-based capital (withdraw blocked while the pool has open positions against it). |
+| `record_lp_market_fill` | sequencer | Record per-market pool exposure deltas. |
 
-## Vaults (v3)
+## Vaults
 
 | Instruction | Access | Purpose |
 |---|---|---|
-| `create_vault_v3` / `vault_open_trader_state_v3` | strategist | Create a vault and its trading identity. |
-| `vault_deposit_v3` / `vault_withdraw_v3` | depositor | NAV-share deposits/withdrawals (withdraw blocked with open positions). |
-| `vault_place_order_v3` / `vault_cancel_order_v3` | strategist | Trade the vault's book presence. |
-| `settle_vault_perf_fee_v3` | strategist | High-water-mark performance fee in shares. |
+| `create_vault` / `vault_open_trader_state` | strategist | Create a vault and its trading identity. |
+| `vault_deposit` / `vault_withdraw` | depositor | NAV-share deposits/withdrawals (withdraw blocked with open positions). |
+| `vault_place_order` / `vault_cancel_order` | strategist | Trade the vault's book presence. |
+| `settle_vault_perf_fee` | strategist | High-water-mark performance fee in shares. |
 
 ## Trader & collateral
 
@@ -116,7 +114,6 @@ noted).
 | `transfer_main_to_sub` / `transfer_sub_to_main` | trader | Sub-account collateral moves (margin-gated outbound). |
 | `sweep_collateral` | trader | Cross-account consolidation under a joint stress gate. |
 | `init_trader_ata` / `close_trader_ata` | trader | Program-validated associated token accounts. |
-| `migrate_position_to_trader_state_key` | trader | One-time move of a legacy position PDA to the trader-state-keyed derivation. |
 | `set_position_leverage` / `set_position_isolated` / `set_position_cross` | trader | Leverage cap and margin-mode switches (coverage-gated). |
 | `set_trader_referrer` / `set_trader_builder` / `set_trader_delegate` | trader | One-time referrer, capped builder code, trading delegate. |
 | `set_trader_fee_tier` | authority | Assign a fee tier (discount capped at 100%). |
@@ -125,8 +122,8 @@ noted).
 
 | Instruction | Access | Purpose |
 |---|---|---|
-| `liquidate_position_v2` | permissionless | Close an unhealthy position at the worse-of(mark, oracle) health price; reward bounded by residual equity; no self-liquidation; blocked while paused. |
-| `liquidate_portfolio_v2` | permissionless | Portfolio-level liquidation via synthetic close orders. |
+| `liquidate_position` | permissionless | Close an unhealthy position at the worse-of(mark, oracle) health price; reward bounded by residual equity; no self-liquidation; blocked while paused. |
+| `liquidate_portfolio` | permissionless | Portfolio-level liquidation via synthetic close orders. |
 | `auto_deleverage` | permissionless | Force-close the best counter-position at the bankruptcy price, only against true bankruptcy, value-conserving; blocked while paused. |
 | `place_jit_liquidation_offer` / `cancel_jit_liquidation_offer` | maker | Bid to absorb liquidations at better-than-synthetic prices. |
 
@@ -173,4 +170,4 @@ noted).
 
 | Instruction | Access | Purpose |
 |---|---|---|
-| `view_book_depth_v2` / `view_quote_ladder` / `view_predicted_funding` / `view_portfolio_risk` / `view_trader_effective_tier` | permissionless (simulate) | Event-emitting read probes for UIs via transaction simulation. |
+| `view_book_depth` / `view_quote_ladder` / `view_predicted_funding` / `view_portfolio_risk` / `view_trader_effective_tier` | permissionless (simulate) | Event-emitting read probes for UIs via transaction simulation. |

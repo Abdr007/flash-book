@@ -223,7 +223,7 @@ try {
 
   await stage("ER maker rests 4 bids on the delegated book", async () => {
     for (let i = 0; i < 4; i++)
-      await send(er, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(90000 - i * 10), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
+      await send(er, await program.methods.placeLimitOrder(0, new BN(1), new BN(90000 - i * 10), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
   });
 
   await stage(`cranker converges the attestation to ${expected} (no manual attest)`, async () => {
@@ -261,7 +261,7 @@ try {
   });
 
   await stage("ER taker sweeps all 4 bids", async () => {
-    await send(er, await program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
+    await send(er, await program.methods.placeTakerOrder(1, new BN(4), new BN(1), 0, new BN(0), 0)
       .accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null })
       .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   });
@@ -294,7 +294,7 @@ try {
   await stage("B: maker re-deposits + rests 4 bids on the L1 book → reservation stacks across markets", async () => {
     await send(l1, await program.methods.depositCollateral(new BN(1_000_000_000)).accountsPartial({ trader: maker.publicKey, traderState: makerTS, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: makerAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM }).instruction(), [maker]);
     for (let i = 0; i < 4; i++)
-      await send(l1, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(90000 - i * 10), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: MB, marketBook: BOOKB, traderState: makerTS, position: null }).instruction(), [maker]);
+      await send(l1, await program.methods.placeLimitOrder(0, new BN(1), new BN(90000 - i * 10), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: MB, marketBook: BOOKB, traderState: makerTS, position: null }).instruction(), [maker]);
     await until(`maker attestation == ${expected * 2n} (A fills + B orders)`, async () => {
       const a = await program.account.erMarginAttestation.fetch(makerEM);
       return BigInt(a.reservedMarginQuoteLots.toString()) === expected * 2n ? a : null;
@@ -303,7 +303,7 @@ try {
   });
 
   await stage("B: taker sweeps on L1 → both sides reserved for BOTH markets' unsettled fills", async () => {
-    await send(l1, await program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
+    await send(l1, await program.methods.placeTakerOrder(1, new BN(4), new BN(1), 0, new BN(0), 0)
       .accountsPartial({ trader: taker.publicKey, market: MB, marketBook: BOOKB, traderState: takerTS, position: null })
       .remainingAccounts([{ pubkey: FCB, isWritable: true, isSigner: false }, { pubkey: FOB, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
     await until(`taker attestation == ${expected * 2n}`, async () => {

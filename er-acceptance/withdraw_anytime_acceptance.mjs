@@ -185,9 +185,9 @@ async function buildMarket(refParams) {
 }
 
 const restBidIx = (mkt, tick) =>
-  program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: mkt.M, marketBook: mkt.BOOK, traderState: makerTS, position: null }).instruction();
+  program.methods.placeLimitOrder(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: mkt.M, marketBook: mkt.BOOK, traderState: makerTS, position: null }).instruction();
 const takerSweepIx = (mkt) =>
-  program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
+  program.methods.placeTakerOrder(1, new BN(4), new BN(1), 0, new BN(0), 0)
     .accountsPartial({ trader: taker.publicKey, market: mkt.M, marketBook: mkt.BOOK, traderState: takerTS, position: null })
     .remainingAccounts([{ pubkey: mkt.FC, isWritable: true, isSigner: false }, { pubkey: mkt.FO, isWritable: true, isSigner: false }]).instruction();
 const strictWithdrawIx = (amount) =>

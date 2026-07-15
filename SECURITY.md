@@ -8,8 +8,7 @@ real value against the current code.
 The engine is code-complete for its current scope, with machine-checked
 invariants in CI (see `docs/FORMAL_VERIFICATION.md`). The gates that remain
 before real value are a professional external audit and the operational
-steps in `docs/OPERATIONS.md` (per-market fill-commitment v1 upgrade,
-multisig authority migration).
+steps in `docs/OPERATIONS.md` (multisig authority migration).
 
 ## Reporting a vulnerability
 
@@ -31,8 +30,8 @@ acknowledge within 72 hours.
   cause incorrect collateral movement, position state, oracle acceptance,
   liquidation-reward routing, or account-control bypass.
 - The risk math in `programs/clober/src/matcher/`: anything that
-  violates the invariants in `docs/MARGIN_MATH.md` / `docs/HAIRCUT_MATH.md` /
-  `docs/SAFETY.md`. The conservation and solvency invariants are
+  violates the invariants in `INVARIANTS.md` / `docs/MARGIN_MATH.md` /
+  `docs/HAIRCUT_MATH.md`. The conservation and solvency invariants are
   machine-checked — a violation that Kani/Lean should have caught is a
   doubly interesting report.
 - The ER boundary: anything that lets a sequencer or any third party forge,
@@ -91,7 +90,7 @@ the code and the documentation tell the same story an external auditor will:
 
 ## External audit
 
-Not yet engaged. The audit entry points are: `docs/SAFETY.md` (threat model
+Not yet engaged. The audit entry points are: `INVARIANTS.md` (threat model
 and invariants), `ER_TRUST_BOUNDARY.md` (trust boundary + what is proven
 where), `docs/SETTLEMENT.md` (settlement authenticity design),
 `docs/FORMAL_VERIFICATION.md` (proof inventory), and the reproducible test

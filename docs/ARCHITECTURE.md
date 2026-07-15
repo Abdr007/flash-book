@@ -3,7 +3,7 @@
 Clober is an on-chain central limit order book (CLOB) perpetual-futures
 engine for Solana. Matching runs at rollup speed on a MagicBlock Ephemeral
 Rollup (ER); custody, risk, and settlement live on the base layer (L1). The
-program surface is 146 instructions, 137 events, and 109 error codes
+program surface is 162 instructions, 146 events, and 120 typed errors
 (`idl/clober.json` is the source of truth).
 
 ```
@@ -17,7 +17,7 @@ program surface is 146 instructions, 137 events, and 109 error codes
         │                         funding snapshot       │
         │  LiquidityPoolAccount   · pool capital + NAV     │
         │  InsuranceFundAccount · waterfall backstop     │
-        │  Vaults v3            · strategist vaults      │
+        │  Vaults native            · strategist vaults      │
         │  Oracle configs       · Pyth / Lazer bindings  │
         │  Governance PDAs      · guardian, pending      │
         │                         transfer/params,       │
@@ -32,7 +32,7 @@ program surface is 146 instructions, 137 events, and 109 error codes
         │                                                │
         │  MarketBook (hypertree slab; bids + asks)      │
         │  place/cancel/modify · continuous price-time   │
-        │  place_taker_order_v2 · walks the book,        │
+        │  place_taker_order · walks the book,        │
         │    pushes keccak fill commitments to the ring  │
         │    and full fill records to the outbox         │
         │  LP auto-quoter ladder                        │
@@ -52,7 +52,7 @@ transaction.
 
 The settlement loop:
 
-1. **Match (ER).** `place_taker_order_v2` walks the opposite side of the
+1. **Match (ER).** `place_taker_order` walks the opposite side of the
    book in price-time order. Each fill is appended to the fill-commitment
    ring as a keccak commitment and to the fill outbox as a full record.
 2. **Commit (ER → L1).** The book, ring, and outbox are committed back to
@@ -88,7 +88,7 @@ legs), and basket orders (multi-leg with a cross-market margin gate).
 
 A reduce-only order can never open or flip a position: intake clamps its
 size against the position's remaining reducible capacity (cumulative across
-all resting reduce-only orders), and on markets with the v1 fill-commitment
+all resting reduce-only orders), and on markets with the fill-commitment
 ring the matcher additionally tracks reduce-in-flight per position inside
 the ring itself, so the cap holds across the match→settle gap.
 
@@ -113,7 +113,7 @@ just-in-time windfall capture.
   Hedged books collapse to maintenance-only. Positions may be
   cross-margined (pooled collateral) or isolated (per-position bucket).
   Initial margin is enforced at order intake; withdrawals re-run the gate.
-- **Liquidation.** `liquidate_position_v2` prices health on the *worse of*
+- **Liquidation.** `liquidate_position` prices health on the *worse of*
   mark and oracle (falling back to oracle-only when the mark is stale — an
   ER stall cannot freeze an adverse mark into liquidations). Rewards are
   bounded by residual equity; self-liquidation is forbidden; nothing
@@ -206,9 +206,9 @@ stated precisely in `ER_TRUST_BOUNDARY.md` and `SECURITY.md`.
 ```
 programs/clober/src/
 ├── lib.rs            handlers, account contexts, events (the on-chain shell)
-├── state.rs          v1 accounts: market, trader, position, insurance
-├── state_v2.rs       order-book slab: MarketBookHandle, resting orders
-├── state_v3.rs       v3 accounts: triggers/TWAP/iceberg, oracle configs,
+├── state.rs          market, trader, position, insurance accounts
+├── book_state.rs       order-book slab: MarketBookHandle, resting orders
+├── extended_state.rs trigger/TWAP/iceberg, oracle configs,
 │                     committee, haircut + side-accrual + envelope state
 ├── er.rs             MagicBlock delegation/commit/undelegate CPIs + liveness
 ├── er_permission.rs  TEE private-ER read-permission CPIs
@@ -220,7 +220,7 @@ programs/clober/src/
 └── matcher/          pure engine math (no Solana account types):
     ├── order, lot            order/side/price-lot primitives
     ├── envelope              per-slot price/funding move proofs
-    ├── fill_commitment       keccak settlement ring (+ v1 reduce-in-flight)
+    ├── fill_commitment       keccak settlement ring (+ reduce-in-flight)
     ├── fill_outbox           full fill records for off-log settlement reads
     ├── lp_quoter            deterministic pool quoting ladder
     ├── risk                  stress-lattice margin + fee tiers
@@ -239,4 +239,4 @@ programs/clober/src/
 Formal verification (62 Kani harnesses, 7 Lean proof modules, property suites):
 `docs/FORMAL_VERIFICATION.md`. Math specs: `docs/MATH.md`,
 `docs/MARGIN_MATH.md`, `docs/HAIRCUT_MATH.md`. Threat model:
-`docs/SAFETY.md`.
+`INVARIANTS.md`.

@@ -1,19 +1,19 @@
 // ── CRITICAL-PATH 6+2+2 DEVNET ACCEPTANCE ────────────────────────────────────
 // Validates the launch-gate fix queue LIVE on a FRESH throwaway devnet program:
-//   H-A (6): intake initial-margin gate on the 6 v3 injection / vault-open paths
+//   margin-gate (6): intake initial-margin gate on the 6 order injection / vault-open paths
 //            (execute_trigger, execute_twap, place_iceberg, replenish_iceberg,
 //            place_bracket, vault_place) — an OPENING inject from a zero-collateral
 //            state MUST reject with InsufficientCollateral (6000+16). Reduce-only exempt.
-//   H-B (2): a real liquidation injects an order_type==3 close order; the liquidatee
+//   liquidation-lock (2): a real liquidation injects an order_type==3 close order; the liquidatee
 //            CANNOT cancel it (LiquidationOrderNotCancelable / 2325); the market
-//            authority CAN retire it (retire_liquidation_order_v2).
-//   M-2 (2): withdraw/sweep price via effective_health_mark (worse-of) — an adverse
+//            authority CAN retire it (retire_liquidation_order).
+//   withdrawal-price (2): withdraw/sweep price via effective_health_mark (worse-of) — an adverse
 //            mark tightens the withdraw gate (a withdraw allowed at a benign mark is
 //            rejected once the worse-of mark makes the account under-margined).
 //
 // EVERY row is a REAL tx: a PASS row is a real signature (positive) or a real
 // rejection carrying the RIGHT asserted error code (negative). No hand-crafted
-// order_type==3 — H-B drives a real liquidate_position_v2. Nothing is faked; a check
+// order_type==3 — liquidation-lock drives a real liquidate_position. Nothing is faked; a check
 // that cannot be driven cleanly is reported UNDRIVEN, never as a pass.
 //
 //   PROGRAM=<fresh id> L1_RPC=<devnet> node er-acceptance/critical_path_acceptance.mjs
@@ -27,7 +27,7 @@ const { Program, AnchorProvider, Wallet, BN } = anchor;
 // — the public endpoint rate-limits genesis. PROGRAM defaults to the throwaway acceptance program.
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 const FRESH = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD");
-const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
+const OLD = new PublicKey("8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (sig) => `https://explorer.solana.com/tx/${sig}?cluster=devnet`;
 
@@ -129,7 +129,7 @@ const insAcc = await program.account.insuranceFundAccount.fetch(INS);
 const VAULT = insAcc.quoteVault;
 console.log(`  insurance ${INS.toBase58().slice(0, 8)}…  vault ${VAULT.toBase58().slice(0, 8)}…`);
 
-// IM>0 market (H-A + M-2). base_mint is any fresh key (unchecked); oracle_account unchecked.
+// IM>0 market (margin-gate + withdrawal-price). base_mint is any fresh key (unchecked); oracle_account unchecked.
 const base = Keypair.generate();
 const M = pda(["market", base.publicKey, QUOTE]);
 const BOOK = pda(["market_book", M]);
@@ -155,67 +155,67 @@ const nowSlot = await l1.getSlot("confirmed");
 const EXP = new BN(nowSlot + 1_000_000);
 const CODE = (n) => IDL.errors.find(e => e.name === n).code;
 
-// ══ H-A (6) ══════════════════════════════════════════════════════════════════
-console.log("── H-A: intake initial-margin gate on 6 v3 injection / vault-open paths ──");
+// ══ margin-gate (6) ══════════════════════════════════════════════════════════════════
+console.log("── margin-gate: intake initial-margin gate on 6 order injection / vault-open paths ──");
 
-// [HA-3] place_iceberg_order_v3 — direct place-time gate (opening, zero collateral)
-await expectReject("HA-3", "H-A", "place_iceberg (open, 0-collateral)", CODE("InsufficientCollateral"), async () => {
-  const ice = pda(["iceberg_v3", M, Z.publicKey, Buffer.from([7])]);
-  return send(await program.methods.placeIcebergOrderV3(7, 0, new BN(10), new BN(2), new BN(90000), EXP, 0).accountsPartial({ trader: Z.publicKey, traderState: ZTS, position: null, market: M, marketBook: BOOK, icebergOrder: ice, systemProgram: sys }).instruction(), [Z]);
+// [margin-gate-3] place_iceberg_order — direct place-time gate (opening, zero collateral)
+await expectReject("margin-gate-3", "margin-gate", "place_iceberg (open, 0-collateral)", CODE("InsufficientCollateral"), async () => {
+  const ice = pda(["iceberg", M, Z.publicKey, Buffer.from([7])]);
+  return send(await program.methods.placeIcebergOrder(7, 0, new BN(10), new BN(2), new BN(90000), EXP, 0).accountsPartial({ trader: Z.publicKey, traderState: ZTS, position: null, market: M, marketBook: BOOK, icebergOrder: ice, systemProgram: sys }).instruction(), [Z]);
 });
 
-// [HA-5] place_bracket_order_v3 — direct place-time gate
-await expectReject("HA-5", "H-A", "place_bracket (open, 0-collateral)", CODE("InsufficientCollateral"), async () => {
-  const tp = pda(["trigger_v3", M, Z.publicKey, Buffer.from([11])]);
-  const sl = pda(["trigger_v3", M, Z.publicKey, Buffer.from([12])]);
-  return send(await program.methods.placeBracketOrderV3(0, new BN(10), new BN(90000), 11, new BN(95000), new BN(95000), 12, new BN(85000), new BN(85000), EXP, 0).accountsPartial({ trader: Z.publicKey, traderState: ZTS, position: null, market: M, marketBook: BOOK, tpTrigger: tp, slTrigger: sl, systemProgram: sys }).instruction(), [Z]);
+// [margin-gate-5] place_bracket_order — direct place-time gate
+await expectReject("margin-gate-5", "margin-gate", "place_bracket (open, 0-collateral)", CODE("InsufficientCollateral"), async () => {
+  const tp = pda(["trigger", M, Z.publicKey, Buffer.from([11])]);
+  const sl = pda(["trigger", M, Z.publicKey, Buffer.from([12])]);
+  return send(await program.methods.placeBracketOrder(0, new BN(10), new BN(90000), 11, new BN(95000), new BN(95000), 12, new BN(85000), new BN(85000), EXP, 0).accountsPartial({ trader: Z.publicKey, traderState: ZTS, position: null, market: M, marketBook: BOOK, tpTrigger: tp, slTrigger: sl, systemProgram: sys }).instruction(), [Z]);
 });
 
-// [HA-6] vault_place_order_v3 — vault with a 0-collateral vault TraderState
-await expectReject("HA-6", "H-A", "vault_place_order (open, 0-collateral vault)", CODE("InsufficientCollateral"), async () => {
+// [margin-gate-6] vault_place_order — vault with a 0-collateral vault TraderState
+await expectReject("margin-gate-6", "margin-gate", "vault_place_order (open, 0-collateral vault)", CODE("InsufficientCollateral"), async () => {
   const vid = 1 + Math.floor((nowSlot % 240));
-  const vault = pda(["vault_v3", signer.publicKey, Buffer.from([vid])]);
+  const vault = pda(["vault", signer.publicKey, Buffer.from([vid])]);
   const vts = pda(["trader_state", vault]);
-  if (!(await l1.getAccountInfo(vault))) await send(await program.methods.createVaultV3(vid, Array(32).fill(0), 0).accountsPartial({ strategist: signer.publicKey, vault, systemProgram: sys }).instruction());
-  if (!(await l1.getAccountInfo(vts))) await send(await program.methods.vaultOpenTraderStateV3().accountsPartial({ strategist: signer.publicKey, vault, vaultTraderState: vts, systemProgram: sys }).instruction());
-  return send(await program.methods.vaultPlaceOrderV3(0, new BN(10), new BN(90000), 0, EXP).accountsPartial({ strategist: signer.publicKey, vault, market: M, marketBook: BOOK, vaultTraderState: vts, position: null }).instruction());
+  if (!(await l1.getAccountInfo(vault))) await send(await program.methods.createVault(vid, Array(32).fill(0), 0).accountsPartial({ strategist: signer.publicKey, vault, systemProgram: sys }).instruction());
+  if (!(await l1.getAccountInfo(vts))) await send(await program.methods.vaultOpenTraderState().accountsPartial({ strategist: signer.publicKey, vault, vaultTraderState: vts, systemProgram: sys }).instruction());
+  return send(await program.methods.vaultPlaceOrder(0, new BN(10), new BN(90000), 0, EXP).accountsPartial({ strategist: signer.publicKey, vault, market: M, marketBook: BOOK, vaultTraderState: vts, position: null }).instruction());
 });
 
-// [HA-1] execute_trigger_order_v3 — routes through the SAME gate_injection_open helper as
-// HA-3/5/6 (verified: 6 call sites → one helper), but its context REQUIRES an existing
+// [margin-gate-1] execute_trigger_order — routes through the SAME gate_injection_open helper as
+// margin-gate-3/5/6 (verified: 6 call sites → one helper), but its context REQUIRES an existing
 // `position` account (AccountLoader, not optional), so it is inherently a funded-trader path
 // (a stop/TP on a held position that injects an opening leg). Not drivable from the
 // zero-collateral Z (no position); reported UNDRIVEN, not faked. The gate itself is proven live
-// by HA-3/5/6 (identical InsufficientCollateral rejection).
-record("HA-1", "H-A", "execute_trigger (inject) — shared gate", "UNDRIVEN", "same gate_injection_open as HA-3/5/6; needs an existing position (funded path)");
+// by margin-gate-3/5/6 (identical InsufficientCollateral rejection).
+record("margin-gate-1", "margin-gate", "execute_trigger (inject) — shared gate", "UNDRIVEN", "same gate_injection_open as margin-gate-3/5/6; needs an existing position (funded path)");
 
-// [HA-2] execute_twap_slice_v3 — routes through the SAME gate_injection_open helper. Its own
+// [margin-gate-2] execute_twap_slice — routes through the SAME gate_injection_open helper. Its own
 // slice-eligibility checks (active/timing/min-lots/oracle-slippage, all `OutOfRange`) fire
 // before the intake gate and can't be cleanly satisfied from the zero-collateral Z on a fresh
 // market, so the shared gate isn't reached here. Reported UNDRIVEN (the intake gate is proven
-// live by HA-3/5/6); NOT a gate failure.
-record("HA-2", "H-A", "execute_twap_slice (inject) — shared gate", "UNDRIVEN", "same gate_injection_open as HA-3/5/6; twap slice-eligibility (OutOfRange) precedes the gate");
+// live by margin-gate-3/5/6); NOT a gate failure.
+record("margin-gate-2", "margin-gate", "execute_twap_slice (inject) — shared gate", "UNDRIVEN", "same gate_injection_open as margin-gate-3/5/6; twap slice-eligibility (OutOfRange) precedes the gate");
 
-// [HA-4] replenish_iceberg_v3 — needs an iceberg resting then a depleted-margin replenish.
-// Zero-collateral Z cannot place an iceberg (HA-3 proves that), so the replenish injection
+// [margin-gate-4] replenish_iceberg — needs an iceberg resting then a depleted-margin replenish.
+// Zero-collateral Z cannot place an iceberg (margin-gate-3 proves that), so the replenish injection
 // gate is exercised via a trader that placed WITH collateral then had it withdrawn. Driven
-// in the H-B/M-2 funded section if reached; otherwise reported UNDRIVEN (never faked).
-record("HA-4", "H-A", "replenish_iceberg (inject gate)", "UNDRIVEN", "requires placed-then-depleted iceberg (see notes)");
+// in the liquidation-lock/withdrawal-price funded section if reached; otherwise reported UNDRIVEN (never faked).
+record("margin-gate-4", "margin-gate", "replenish_iceberg (inject gate)", "UNDRIVEN", "requires placed-then-depleted iceberg (see notes)");
 
 // reduce-only exemption — an intake gate must NOT reject a reduce-only inject.
 // (Positive control for the gate's reduce-only carve-out.) Uses place_iceberg reduce-only
 // flag path via a trigger with reduce_only=true from Z: with no position it clamps to 0 and
 // is exempt from the margin requirement (assert_injection_intake returns Ok on reduce-only).
-await expectOk("HA-RO", "H-A", "reduce-only inject is EXEMPT (not margin-gated)", async () => {
+await expectOk("HA-RO", "margin-gate", "reduce-only inject is EXEMPT (not margin-gated)", async () => {
   const tid = 41;
-  const trig = pda(["trigger_v3", M, Z.publicKey, Buffer.from([tid])]);
-  if (!(await l1.getAccountInfo(trig))) return send(await program.methods.placeTriggerOrderV3(tid, 0, 0, new BN(10), new BN(1), new BN(90000), true, EXP, 0, new BN(0)).accountsPartial({ trader: Z.publicKey, traderState: ZTS, market: M, triggerOrder: trig, systemProgram: sys }).instruction(), [Z]);
+  const trig = pda(["trigger", M, Z.publicKey, Buffer.from([tid])]);
+  if (!(await l1.getAccountInfo(trig))) return send(await program.methods.placeTriggerOrder(tid, 0, 0, new BN(10), new BN(1), new BN(90000), true, EXP, 0, new BN(0)).accountsPartial({ trader: Z.publicKey, traderState: ZTS, market: M, triggerOrder: trig, systemProgram: sys }).instruction(), [Z]);
   throw new Error("exists");
 });
 
-// ══ FUNDED DRIVE: real position → M-2 withdraw pricing → real liquidation → H-B ══
+// ══ FUNDED DRIVE: real position → withdrawal-price withdraw pricing → real liquidation → liquidation-lock ══
 console.log("\n── FUNDED DRIVE: forming a real position (maker rests · taker crosses · sequencer apply_fill) ──");
-// order-id reconstruction (mirrors state_v2::encode_order_id)
+// order-id reconstruction (mirrors book_state::encode_order_id)
 const MAXP = (1n << 40n) - 1n, MAXS = (1n << 24n) - 1n;
 const encodeOrderId = (price, seq, isBid) => { const p = BigInt(Math.min(price, Number(MAXP))); const key = isBid ? (~p) & MAXP : p; return ((key << 24n) | (BigInt(seq) & MAXS)); };
 const evCoder = new anchor.BorshCoder(IDL_FRESH);
@@ -255,8 +255,8 @@ try {
   T = Keypair.generate(); TTS = await fund(T, 40_000);
   console.log(`  maker W ${W.publicKey.toBase58().slice(0, 8)}… (rich)   taker T ${T.publicKey.toBase58().slice(0, 8)}… (40k collateral on 100k notional)`);
   // maker rests a size-1 ASK @ 100000 (opens a short); taker BUYS crossing it (opens a long)
-  await send(await program.methods.placeLimitOrderV2(1, new BN(1), new BN(100000), 0, EXP, 0).accountsPartial({ trader: W.publicKey, market: M, marketBook: BOOK, traderState: WTS, position: null }).instruction(), [W]);
-  await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, EXP, 0).accountsPartial({ trader: T.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction(), [T], 1_000_000);
+  await send(await program.methods.placeLimitOrder(1, new BN(1), new BN(100000), 0, EXP, 0).accountsPartial({ trader: W.publicKey, market: M, marketBook: BOOK, traderState: WTS, position: null }).instruction(), [W]);
+  await send(await program.methods.placeTakerOrder(0, new BN(1), new BN(100000), 0, EXP, 0).accountsPartial({ trader: T.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction(), [T], 1_000_000);
   // sequencer settles the (deterministic) single fill → both positions form
   const Tpos = pda(["position", M, TTS]), Wpos = pda(["position", M, WTS]);
   await send(await program.methods.applyFill(new BN(1), new BN(100000), 0, false, 0, 0, new BN(0)).accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TTS, makerTraderState: WTS, takerPosition: Tpos, makerPosition: Wpos, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, makerPositionHaircut: null, systemProgram: sys }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction(), [], 1_000_000);
@@ -267,20 +267,20 @@ try {
   if (position_formed) {
     const Tapos = ata(T.publicKey, QUOTE);
     const tryWithdraw = async () => { try { const s = await send(await program.methods.withdrawCollateral(new BN(1)).accountsPartial({ trader: T.publicKey, traderState: TTS, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: Tapos, quoteVault: VAULT, tokenProgram: TOKEN }).instruction(), [T]); return { ok: true, sig: s }; } catch (e) { return { ok: false, ...errCodeOf(e) }; } };
-    // M-2 positive control: a small withdraw at the benign mark. On these cloned (mainnet-like)
+    // withdrawal-price positive control: a small withdraw at the benign mark. On these cloned (mainnet-like)
     // params the stress-lattice INITIAL margin ≈ full notional, so a thin trader has no free
     // collateral even at the benign price — the benign withdraw only ACCEPTS if the trader is
     // over-collateralised. We record honestly: a clean accept→reject FLIP is only claimed when the
-    // benign case genuinely ACCEPTED (else M-2 is reported UNDRIVEN on these params, not faked).
+    // benign case genuinely ACCEPTED (else withdrawal-price is reported UNDRIVEN on these params, not faked).
     const w0 = await tryWithdraw();
     const benignOk = w0.ok;
-    record("M2-1", "M-2", "withdraw at benign mark (healthy) accepted", benignOk ? "PASS" : "UNDRIVEN", benignOk ? "accepted ✓" : `already margin-bound at benign (stress-IM≈notional; ${w0.name}) — flip test N/A`, w0.sig);
+    record("withdrawal-price-1", "withdrawal-price", "withdraw at benign mark (healthy) accepted", benignOk ? "PASS" : "UNDRIVEN", benignOk ? "accepted ✓" : `already margin-bound at benign (stress-IM≈notional; ${w0.name}) — flip test N/A`, w0.sig);
     // adverse move: step the ORACLE down ~9%/slot (envelope-capped at 10%). Raw mark stays 100000
     // (no fills moved it); the worse-of effective_health_mark tracks the falling oracle. If the
     // benign case accepted, record the accept→reject FLIP (proof withdraw prices on worse-of, not
     // raw mark). Regardless, keep dropping to drive the REAL liquidation (order_type==3 injection).
     let px = 100000, flipDone = !benignOk, liqSig = null, injSide = null, injOrderId = null;
-    if (!benignOk) record("M2-2", "M-2", "withdraw rejected once worse-of mark under-margins", "UNDRIVEN", "benign control did not accept on these params (see M2-1)");
+    if (!benignOk) record("withdrawal-price-2", "withdrawal-price", "withdraw rejected once worse-of mark under-margins", "UNDRIVEN", "benign control did not accept on these params (see withdrawal-price-1)");
     for (let step = 0; step < 26 && !liqSig; step++) {
       px = Math.max(1, Math.floor(px * 0.91));
       const oix = await pushOracle(px);
@@ -288,32 +288,32 @@ try {
       await sleep(600); // cross a slot (envelope forbids same-slot moves)
       if (!flipDone) {
         const w = await tryWithdraw();
-        if (!w.ok && w.code === CODE("InsufficientCollateral")) { record("M2-2", "M-2", "withdraw rejected once worse-of mark under-margins", "PASS", `accepted at oracle=100000, rejected (InsufficientCollateral) at oracle=${px} while raw mark stayed 100000 → prices on worse-of ✓`); flipDone = true; }
-        else if (!w.ok) { record("M2-2", "M-2", "withdraw rejected once worse-of mark under-margins", "FAIL", `rejected with ${w.name} — wanted InsufficientCollateral`); flipDone = true; }
+        if (!w.ok && w.code === CODE("InsufficientCollateral")) { record("withdrawal-price-2", "withdrawal-price", "withdraw rejected once worse-of mark under-margins", "PASS", `accepted at oracle=100000, rejected (InsufficientCollateral) at oracle=${px} while raw mark stayed 100000 → prices on worse-of ✓`); flipDone = true; }
+        else if (!w.ok) { record("withdrawal-price-2", "withdrawal-price", "withdraw rejected once worse-of mark under-margins", "FAIL", `rejected with ${w.name} — wanted InsufficientCollateral`); flipDone = true; }
       }
-      try { liqSig = await send(await program.methods.liquidatePositionV2(new BN(1)).accountsPartial({ caller: signer.publicKey, market: M, marketBook: BOOK, traderState: TTS, callerTraderState: STS, position: Tpos, systemProgram: sys }).instruction(), [], 1_000_000); } catch { /* NotLiquidatable yet — keep dropping */ }
+      try { liqSig = await send(await program.methods.liquidatePosition(new BN(1)).accountsPartial({ caller: signer.publicKey, market: M, marketBook: BOOK, traderState: TTS, callerTraderState: STS, position: Tpos, systemProgram: sys }).instruction(), [], 1_000_000); } catch { /* NotLiquidatable yet — keep dropping */ }
     }
-    record("LIQ", "SETUP", "liquidate_position_v2 injects the synthetic close (order_type==3)", liqSig ? "PASS" : "UNDRIVEN", liqSig ? `real liquidation at oracle=${px}` : `not liquidatable within 26 steps (oracle=${px})`, liqSig);
+    record("LIQ", "SETUP", "liquidate_position injects the synthetic close (order_type==3)", liqSig ? "PASS" : "UNDRIVEN", liqSig ? `real liquidation at oracle=${px}` : `not liquidatable within 26 steps (oracle=${px})`, liqSig);
     if (liqSig) {
       const tx = await withRetry(() => l1.getTransaction(liqSig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }));
       for (const line of (tx?.meta?.logMessages || [])) {
         const mm = line.match(/Program data: (.+)$/); if (!mm) continue;
         // NOTE: the event's `side` is the POSITION side (pos_side); the injected close order
         // rests on the OPPOSITE (close) side, and its order_id is encoded with that close side.
-        try { const ev = evCoder.events.decode(mm[1].trim()); if (ev?.name === "LiquidationInjectedV2Event") { const closeSide = 1 - ev.data.side; injSide = closeSide; injOrderId = encodeOrderId(ev.data.limit_ticks.toNumber(), ev.data.order_seq.toNumber(), closeSide === 0); } } catch {}
+        try { const ev = evCoder.events.decode(mm[1].trim()); if (ev?.name === "LiquidationInjectedEvent") { const closeSide = 1 - ev.data.side; injSide = closeSide; injOrderId = encodeOrderId(ev.data.limit_ticks.toNumber(), ev.data.order_seq.toNumber(), closeSide === 0); } } catch {}
       }
     }
     if (injOrderId != null) {
-      console.log(`  injected order_type==3: side=${injSide} order_id=${injOrderId.toString()} (reconstructed from LiquidationInjectedV2Event)`);
-      // H-B negative: the OWNER (liquidatee T) cannot cancel their injected close → LiquidationOrderNotCancelable
-      await expectReject("HB-1", "H-B", "liquidatee CANNOT cancel their order_type==3 (dodge blocked)", CODE("LiquidationOrderNotCancelable"), async () =>
-        send(await program.methods.cancelOrderV2(injSide, new BN(injOrderId.toString())).accountsPartial({ trader: T.publicKey, market: M, marketBook: BOOK }).instruction(), [T]));
-      // H-B positive: the market AUTHORITY can retire a stranded order_type==3
-      await expectOk("HB-2", "H-B", "authority CAN retire the order_type==3 (retire_liquidation_order_v2)", async () =>
-        send(await program.methods.retireLiquidationOrderV2(injSide, new BN(injOrderId.toString())).accountsPartial({ caller: signer.publicKey, market: M, marketBook: BOOK }).instruction()));
+      console.log(`  injected order_type==3: side=${injSide} order_id=${injOrderId.toString()} (reconstructed from LiquidationInjectedEvent)`);
+      // liquidation-lock negative: the OWNER (liquidatee T) cannot cancel their injected close → LiquidationOrderNotCancelable
+      await expectReject("liquidation-lock-1", "liquidation-lock", "liquidatee CANNOT cancel their order_type==3 (dodge blocked)", CODE("LiquidationOrderNotCancelable"), async () =>
+        send(await program.methods.cancelOrder(injSide, new BN(injOrderId.toString())).accountsPartial({ trader: T.publicKey, market: M, marketBook: BOOK }).instruction(), [T]));
+      // liquidation-lock positive: the market AUTHORITY can retire a stranded order_type==3
+      await expectOk("liquidation-lock-2", "liquidation-lock", "authority CAN retire the order_type==3 (retire_liquidation_order)", async () =>
+        send(await program.methods.retireLiquidationOrder(injSide, new BN(injOrderId.toString())).accountsPartial({ caller: signer.publicKey, market: M, marketBook: BOOK }).instruction()));
     } else {
-      record("HB-1", "H-B", "liquidatee cannot cancel order_type==3", "UNDRIVEN", "no LiquidationInjectedV2Event parsed");
-      record("HB-2", "H-B", "authority can retire order_type==3", "UNDRIVEN", "no injected order to retire");
+      record("liquidation-lock-1", "liquidation-lock", "liquidatee cannot cancel order_type==3", "UNDRIVEN", "no LiquidationInjectedEvent parsed");
+      record("liquidation-lock-2", "liquidation-lock", "authority can retire order_type==3", "UNDRIVEN", "no injected order to retire");
     }
   }
 } catch (e) {
@@ -326,7 +326,7 @@ try {
   else if (e?.logs) console.log("  LOGS:\n" + e.logs.join("\n"));
   if (e?.signature) { try { const t = await l1.getTransaction(e.signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }); console.log("  TXLOGS:\n" + (t?.meta?.logMessages || []).join("\n")); } catch {} }
   if (!rows.find(r => r.id === "POS")) record("POS", "SETUP", "real position via apply_fill", "UNDRIVEN", `halted: ${name ?? raw}`);
-  for (const [id, grp, d] of [["M2-1", "M-2", "withdraw benign"], ["M2-2", "M-2", "withdraw adverse"], ["HB-1", "H-B", "owner cancel lock"], ["HB-2", "H-B", "authority retire"]])
+  for (const [id, grp, d] of [["withdrawal-price-1", "withdrawal-price", "withdraw benign"], ["withdrawal-price-2", "withdrawal-price", "withdraw adverse"], ["liquidation-lock-1", "liquidation-lock", "owner cancel lock"], ["liquidation-lock-2", "liquidation-lock", "authority retire"]])
     if (!rows.find(r => r.id === id)) record(id, grp, d, "UNDRIVEN", "funded drive halted upstream");
 }
 
@@ -342,4 +342,4 @@ function summarize() {
 }
 summarize();
 console.log(`\nReal tx sigs + Explorer links per row → er-acceptance/critical_path_results.json`);
-console.log(`Both launch HIGHs (H-A intake gate · H-B liquidation-cancel lock) proven live on ${FRESH.toBase58()}.`);
+console.log(`Both launch HIGHs (margin-gate intake gate · liquidation-lock liquidation-cancel lock) proven live on ${FRESH.toBase58()}.`);

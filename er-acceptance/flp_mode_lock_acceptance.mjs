@@ -1,8 +1,8 @@
 // LP mode-lock live acceptance (F-4). Run AFTER `solana program deploy`.
 //   L1_RPC=<devnet> node lp_mode_lock_acceptance.mjs
-// Proves on-chain that the singleton and per-market v3 LP systems are mutually
+// Proves on-chain that the singleton and per-market LP systems are mutually
 // exclusive on minting LP shares: a singleton deposit claims MODE_SINGLETON,
-// after which a v3 deposit fails closed with LpSystemModeConflict.
+// after which a native deposit fails closed with LpSystemModeConflict.
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -123,28 +123,28 @@ try {
 const mode = await program.account.lpModeAccount.fetch(LP_MODE);
 ok(mode.mode === 1, `lp_mode.mode == 1 (singleton), got ${mode.mode}`);
 
-// ── Negative: a v3 deposit is rejected by the lock ───────────────────────────
-// Reuse the existing REF_MARKET; init its v3 pool if absent (tolerant of an
+// ── Negative: a native deposit is rejected by the lock ───────────────────────────
+// Reuse the existing REF_MARKET; init its per-market pool if absent (tolerant of an
 // already-initialized pool from a prior run).
 const M = REF_MARKET;
 const EXP = pda(["lp_per_market", M]);
 try {
   await send(
     await program.methods
-      .initLpPerMarketV3()
+      .initLpPerMarket()
       .accountsPartial({ authority: signer.publicKey, insuranceFund: INS, market: M, exposure: EXP, systemProgram: sys })
       .instruction(),
   );
 } catch (e) {
   // already initialized — fine
 }
-const POS = pda(["lp_position_v3", EXP, signer.publicKey]);
+const POS = pda(["lp_position", EXP, signer.publicKey]);
 let rejErr = "";
 let rejected = false;
 try {
   await send(
     await program.methods
-      .lpDepositV3(new BN(1_000_000))
+      .lpMarketDeposit(new BN(1_000_000))
       .accountsPartial({
         lp: signer.publicKey,
         exposure: EXP,
@@ -165,7 +165,7 @@ try {
 }
 ok(
   rejected && (rejErr.includes("LpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")),
-  `v3 lp_deposit_v3 REJECTED with LpSystemModeConflict while singleton active${rejected ? "" : " (NOT rejected!)"}`,
+  `native lp_market_deposit REJECTED with LpSystemModeConflict while singleton active${rejected ? "" : " (NOT rejected!)"}`,
 );
 if (rejected && !(rejErr.includes("LpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")))
   console.log("    (rejected but with unexpected error:", rejErr.slice(0, 400), ")");

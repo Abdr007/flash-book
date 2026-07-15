@@ -14,7 +14,7 @@ the Lean proofs on every PR; any broken invariant fails the build.
 |---|---|---|
 | `matcher/haircut` | 7 | Dust conservation (`credit + dust == matured`, nothing minted or burned), single-convert solvency (credit ≤ residual — the non-printing bound), maturation bounds, residual-delta exactness + round-trip conservation, the CBMC division boundary controls. |
 | `matcher/fill_commitment` | 7 | Settlement ring: never over-settles, depth-bounded, rejects uncommitted/fabricated fills, no double-settle; settlement nonce strictly monotone (replay/reorder rejected), advance strict + exact, chain monotone. |
-| `state_v2` | 6 | Order-id price-time priority: better price fills first on both sides, FIFO sequence tiebreak, id injectivity (no collisions among live orders), guard-admitted orders never collide, seq guard matches the encoding precondition. |
+| `book_state` | 6 | Order-id price-time priority: better price fills first on both sides, FIFO sequence tiebreak, id injectivity (no collisions among live orders), guard-admitted orders never collide, seq guard matches the encoding precondition. |
 | `lib` (settlement frame) | 8 | Realized-PnL routing credits exactly one bucket on gain and is bounded/one-sided on loss; cross-loss shortfall conserves and never over-credits; funding routing conserves value, is bounded and one-signed, zero is a no-op. |
 | `matcher/risk` | 6 | Effective MMR never below the base floor (proven on the live `MarketSnapshot::effective_mmr_bps` path), OI surcharge capped and disabled at zero slope, healthy ⇒ survives stress, health verdict independent of mark PnL (no double-count), and the real `assess_margin` symbol's three cross-margin frame invariants over all `u64` collateral (`assess_margin_single_market_frame_stable`). |
 | `matcher/liquidation` | 6 | Health price is always one of the two real sources and the worse one for the side (long and short), fresh mark equals worse-of, stale mark falls back to oracle-only, and the **anti-JELLY** property (`jelly_mark_manipulation_yields_no_usable_equity`): a mark manipulated in the attacker's favour can never move the health price past the honest live oracle, so the $20M Hyperliquid-style mark pump converts to ZERO extra usable equity. |
@@ -28,7 +28,7 @@ the Lean proofs on every PR; any broken invariant fails the build.
 | `er` | 2 | The force-undelegate gate only fires when a liveness baseline is genuinely stale; a market with a fresh heartbeat AND recent settlement can never be forced off the ER. |
 
 Every proven pure function is the one the deployed handler routes through
-(`apply_fill` → `advance_settlement_seq`, `liquidate_position_v2` →
+(`apply_fill` → `advance_settlement_seq`, `liquidate_position` →
 `worse_of_health_price`, `assess_margin` → the proven gate, …), so the
 proofs bind to the shipped logic, not a copy.
 
@@ -136,7 +136,7 @@ conservation, and margin-walk auth/completeness:
 
 | Lean theorem | Statement |
 |---|---|
-| `realized_reconciles_v2` | `pnl·entry = sign·(price−entry)·notional` (exact notional-return reconciliation) |
+| `realized_pnl_reconciles` | `pnl·entry = sign·(price−entry)·notional` (exact notional-return reconciliation) |
 | `long_pnl_pos_iff` | profit iff price crosses entry the right way; breakeven = 0 |
 | `vwap_lower_bound` / `vwap_upper_bound` | `min(entry,price) ≤ vwapEntry ≤ max(entry,price)` |
 
@@ -184,7 +184,7 @@ run — and is the hand-off document for external verification.
 
 ## Known limits
 
-- Haircut credit monotonicity in `h` (`h1 ≤ h2 ⇒ credit(h1) ≤ credit(h2)`)
+- Haircut credit monotonicity in `h` (`lower_haircut ≤ upper_haircut ⇒ credit(lower_haircut) ≤ credit(upper_haircut)`)
   exceeds the SAT backend's reach (two free multiplies); the bound is covered
   by tests and by the Lean cap/monotonicity theorems on the adjacent surfaces.
 - Equality of two free symbolic multiplies is the SAT backend's limit — band

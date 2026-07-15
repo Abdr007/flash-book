@@ -1,13 +1,13 @@
-// HLP (1b) LIVE acceptance on devnet: the pool-backed CLOB loop.
+// liquidity pool (1b) LIVE acceptance on devnet: the pool-backed CLOB loop.
 //   1. init a fresh armed market + book + fill-commitment ring
 //   2. LP posts a resting maker ASK (lp_post_maker_order) — verifies the BPF
 //      stack fix works on the real chain (this instruction crashed pre-fix)
-//   3. a taker crosses it (place_taker_order_v2) -> the matcher pushes a STANDARD
+//   3. a taker crosses it (place_taker_order) -> the matcher pushes a STANDARD
 //      commitment with maker = the lp_exposure PDA
 //   4. assert the ring recorded exactly one produced commitment -> the LP order
 //      rested, was crossed, and is ring-committed (ready for permissionless
 //      apply_lp_fill, which is CI-verified end-to-end).
-// L1_RPC=<devnet> node hlp_acceptance.mjs
+// L1_RPC=<devnet> node liquidity_pool_acceptance.mjs
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -39,7 +39,7 @@ const send = async (ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`HLP live acceptance — L1=${L1_RPC}\n`);
+console.log(`liquidity pool live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
@@ -57,8 +57,8 @@ console.log("1) LP posts a resting maker ASK 1 @ 100_000 (lp_post_maker_order)")
 const postSig = await send(await program.methods.lpPostMakerOrder(1, new BN(1), new BN(100000), new BN(0)).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, lpExposure: LP }).instruction());
 ok(!!postSig, `LP maker order posted LIVE (BPF stack fix holds) — ${postSig.slice(0, 16)}…`);
 
-console.log("2) taker crosses: bid 1 @ 100_000 (place_taker_order_v2)");
-await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+console.log("2) taker crosses: bid 1 @ 100_000 (place_taker_order)");
+await send(await program.methods.placeTakerOrder(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 
 console.log("3) verify the ring recorded the LP-maker fill");
 const fcData = (await l1.getAccountInfo(FC)).data;
@@ -67,5 +67,5 @@ const settled = Number(fcData.readBigUInt64LE(16));
 ok(produced === 1, `matcher pushed exactly one commitment for the crossed LP quote (produced=${produced})`);
 ok(settled === 0, `commitment pending settlement (settled=${settled}) — ready for permissionless apply_lp_fill`);
 
-console.log(`\n${fail === 0 ? "✅ HLP LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ liquidity pool LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

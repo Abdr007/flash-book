@@ -89,7 +89,7 @@ victims from insurance, prosecute keepers who profited.
 
 ### 4. Oracle stops updating
 
-**Detection**: `liquidate_position_v2` returning `OracleTooStale` >
+**Detection**: `liquidate_position` returning `OracleTooStale` >
 30 min. Pyth Solana publisher offline or `update_oracle_from_pyth`
 failing.
 
@@ -112,7 +112,7 @@ positions on-chain.
 
 **Immediate**:
 1. Page on-call. Re-launch keeper instance.
-2. Manually run `liquidate_position_v2` against the worst positions
+2. Manually run `liquidate_position` against the worst positions
    from any wallet (permissionless).
 
 **Investigate**: keeper RPC failover, slot lag, transaction landing

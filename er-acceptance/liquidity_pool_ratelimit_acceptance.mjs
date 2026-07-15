@@ -1,4 +1,4 @@
-// HLP permissionless auto-quoter + rate-limit LIVE acceptance (devnet).
+// liquidity pool permissionless auto-quoter + rate-limit LIVE acceptance (devnet).
 //   1. a NON-authority keeper refreshes the pool's quotes -> PERMISSIONLESS
 //   2. the same keeper immediately re-quotes -> REJECTED (RefreshTooSoon): the
 //      pool's quotes are still fresh, so the book can't be churned
@@ -34,7 +34,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`HLP permissionless + rate-limit live acceptance — L1=${L1_RPC}\n`);
+console.log(`liquidity pool permissionless + rate-limit live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();

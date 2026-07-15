@@ -1,6 +1,6 @@
 # Pyth Oracle Integration
 
-Clober V3 supports two oracle paths per market:
+Clober native supports two oracle paths per market:
 
 1. **Trusted `update_oracle`** — authority writes raw values. Acceptable for devnet/testnet, **never for mainnet**.
 2. **Permissionless `update_oracle_from_pyth`** — reads a real Pyth `PriceUpdateV2` account on-chain. Validates feed_id, staleness, and confidence. Anyone can call.
@@ -51,7 +51,7 @@ The ix validates on-chain:
 - `publish_time` is within `maxStalenessSeconds` of the current slot's Unix time
 - `conf / price` is within `maxConfidenceBps` (in bps)
 
-On success, it writes the price to `market.oracle_price_ticks`. The mark-engine's dual-source health gate (V3) will immediately see the new oracle price.
+On success, it writes the price to `market.oracle_price_ticks`. The mark-engine's dual-source health gate (native) will immediately see the new oracle price.
 
 ## Tick scaling explained
 

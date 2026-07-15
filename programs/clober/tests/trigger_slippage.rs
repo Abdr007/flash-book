@@ -1,4 +1,4 @@
-//! `acceptable_price` slippage cap on v3 trigger orders.
+//! `acceptable_price` slippage cap on trigger orders.
 //!
 //! Verifies `TriggerOrderAccount::slippage_cap_breached` directly
 //! (the pure function the on-chain handler delegates to) and walks

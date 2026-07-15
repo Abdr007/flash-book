@@ -1,4 +1,4 @@
-//! Chaos / model-based differential fuzz of the v2 hypertree order book
+//! Chaos / model-based differential fuzz of the hypertree order book
 //! (`MarketBookHandle`). Random insert/remove sequences are replayed against a
 //! shadow model; after EVERY op the book must agree with the model on count,
 //! find-ability, and price-time ordering — and must never panic. This stresses

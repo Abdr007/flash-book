@@ -1,81 +1,13 @@
 # Operational runbooks
 
-Two operational steps stand between the current code and a
-production-hardened deployment. **Both are deployment/ops actions, not code
-changes** — the on-chain support for each is implemented, tested, and
-proven; what remains is executing the migration on live markets and keys.
+The remaining operational work is a deployment action, not a code migration:
+execute the authority transfer under the release governance process. Every new
+market initializes with the complete settlement layout, including atomic
+reduce-in-flight tracking.
 
 ---
 
-## 1. Per-market fill-commitment v1 upgrade (full reduce-only closure)
-
-### Why
-
-Reduce-only orders are enforced in two tiers
-([SETTLEMENT.md](SETTLEMENT.md) §3):
-
-- **v0 (legacy markets only):** the injection-time capacity clamp closes
-  the primary over-reduce vector at match time, plus a TTL on injected
-  close orders. Only markets whose fill-commitment ring was armed before v1
-  became the default carry the v0 layout.
-- **v1 (default for every new market):** `init_fill_commitment` arms the ring
-  at the v1 layout, which adds per-position reduce-in-flight tracking
-  co-located with the ring, so the tracker commits atomically with settlement.
-  This closes the last edge: a position shrunk below its resting reduce-only
-  size, then over-crossed across the match→settle gap.
-
-New markets are born v1, so no action is needed for them. This runbook applies
-only to **legacy v0 markets**: they are safe against the primary vector, and
-**full closure requires the one-time v1 upgrade on each such market.**
-
-### The instruction
-
-`upgrade_fill_commitment_v1` — market-authority-gated, one-way (a v1 ring
-rejects re-upgrade). Hard preconditions, all enforced on-chain
-(fail-closed):
-
-1. **Base layer, undelegated ring.** A delegated ring is owned by the
-   delegation program; realloc would be illegal. Undelegate first.
-2. **Drained ring** (`produced == settled`). A pending fill would be left
-   without a reduce flag; the upgrade rejects with `FillRingNotDrained`.
-3. The authority tops up rent for the enlarged account automatically
-   (part of the instruction; keep a small SOL balance on the authority).
-
-### Ordering, per market
-
-```
-1. Quiesce:      pause new taker flow at the sequencer (or set_market_status
-                 to a restricted mode) and let apply_fill drain the ring
-                 until produced == settled.
-2. Undelegate:   commit_and_undelegate_market_book +
-                 commit_and_undelegate_fill_commitment (+ outbox) on the ER;
-                 process_undelegation finalizes on L1.
-3. Upgrade:      upgrade_fill_commitment_v1 (authority signs).
-4. Verify:       fetch the ring account; version byte == 1, cap unchanged,
-                 produced == settled, account length ==
-                 fill_commit_account_len_v1(cap). A FillCommitmentUpgradedEvent
-                 is emitted with the old/new byte sizes.
-5. Re-delegate:  delegate_market_book + delegate_fill_commitment
-                 (+ delegate_fill_outbox) together, pinned to the ER validator.
-6. Probe:        place + settle one reduce-only round-trip; confirm the
-                 in-flight counter increments at match and releases at
-                 settlement (integration suite: the v1-ring settle tests).
-7. Resume traffic.
-```
-
-Steps 1–2 and 5 are the same quiesce/undelegate/re-delegate sequence as
-arming a ring ([ER_TRUST_BOUNDARY.md](../ER_TRUST_BOUNDARY.md) §4); the
-upgrade itself is one transaction per market.
-
-### Rollback
-
-None needed or possible: the upgrade is one-way by design, v0 accounts are
-byte-identical until upgraded, and every precondition failure leaves the
-ring untouched.
-
----
-
-## 2. Authority migration to a multisig
+## Authority migration to a multisig
 
 ### Why
 
@@ -98,7 +30,7 @@ compromise is bounded by the commitment ring).
 ```
 1. Create the Squads 3-of-5 (SQUADS_MS). Record its vault PDA (SQUADS_PDA).
 2. Program upgrade authority:
-     solana program set-upgrade-authority 5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq \
+     solana program set-upgrade-authority 8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z \
        --new-upgrade-authority <SQUADS_PDA>
    Verify: solana program show <program-id> lists the multisig.
 3. Per market — sequencer separation first:
@@ -138,10 +70,10 @@ mint LP shares redeemable against the **same** protocol vault
   inventory in `per_market[]`. Its realized PnL is booked automatically at
   settlement by `apply_lp_fill`; capital enters/exits via
   `lp_deposit` / `lp_withdraw`.
-- **Per-market v3** — `LpExposurePerMarketAccountV3`
+- **Per-market pool** — `LpMarketExposureAccount`
   (`[b"lp_per_market", market]`). Its realized PnL is booked by the
-  keeper-driven `record_lp_fill_v3`; capital enters/exits via
-  `lp_deposit_v3` / `lp_withdraw_v3`.
+  keeper-driven `record_lp_market_fill`; capital enters/exits via
+  `lp_market_deposit` / `lp_market_withdraw`.
 
 ### The constraint
 
@@ -150,7 +82,7 @@ on-chain interlock coupling the two (an airtight guard would require a versioned
 `MarketAccount` layout field, which the account has no reserved slack for). If a
 market is operated with LP capital in *both* systems and the same economic fills
 are booked into both, the combined redeemable NAV
-(`NAV_singleton + NAV_v3`) can exceed the vault's true LP backing, so the last
+(`NAV_singleton + NAV_per_market`) can exceed the vault's true LP backing, so the last
 redeemers over-withdraw and the shortfall socializes onto everyone else. This is
 an operational misconfiguration, not an unprivileged exploit: both booking paths
 are privileged (settlement sequencer / insurance-fund authority), and a market
@@ -160,7 +92,7 @@ that only ever uses one system is unaffected.
 
 1. Pick the system at market bring-up. Default to the **singleton** unless a
    per-market share ledger is specifically required.
-2. Never call `lp_deposit` / `record_lp_fill_v3` (v3) against a market
+2. Never call `lp_deposit` / `record_lp_market_fill` (native) against a market
    that already carries capital or inventory in the other system.
 3. If migrating a market between systems, fully drain and zero the source
    system (no shares outstanding, no inventory) before seeding the target.

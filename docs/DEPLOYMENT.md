@@ -1,274 +1,135 @@
 # Deployment runbook
 
-How to take this from `cargo test` to a working market on devnet.
-The same steps apply on mainnet with `--cluster mainnet-beta`.
+This is the operator runbook for a fresh Clober deployment. The generated
+[`idl/clober.json`](../idl/clober.json) is the client contract; this repository
+does not ship an SDK. Do not substitute example account lists for the IDL when
+constructing transactions.
 
-## Prerequisites
+## Preconditions
 
-```bash
-solana --version          # 2.x (Agave)
-anchor --version          # 0.31.x  ← the program's anchor-lang version
-bun --version             # 1.3+
-rustc --version           # 1.84+ for native; nightly for current cargo
-```
+- A new program keypair and a funded deployer for the target cluster.
+- A dedicated upgrade-authority multisig and a separate sequencer key.
+- An audited RPC endpoint, transaction sender, alerting, and rollback owner.
+- The release artifact, IDL, and the 5--7-market launch catalog approved
+  together. The catalog is [`config/mainnet-markets.json`](../config/mainnet-markets.json).
 
-A funded keypair on the target cluster:
+`Anchor.toml` contains localnet and devnet development IDs only. A mainnet
+deployment must use the newly generated program key and must not reuse either
+development address.
 
-```bash
-solana-keygen new -o ~/.config/solana/devnet.json
-solana config set -u devnet -k ~/.config/solana/devnet.json
-solana airdrop 2
-```
-
-## 1. Build (BPF)
+## 1. Verify the release candidate
 
 ```bash
 cd /path/to/clober
-cargo build-sbf --tools-version v1.52 --manifest-path programs/clober/Cargo.toml --sbf-out-dir target/deploy
-# platform-tools v1.52 (rustc 1.89) is required: earlier releases cannot
-# compile edition2024 dependencies.
+anchor idl build -o /tmp/clober-idl-release.json
+node scripts/check-idl-drift.mjs idl/clober.json /tmp/clober-idl-release.json
+node scripts/validate-idl-surface.mjs idl/clober.json
+node scripts/validate-market-catalog.mjs
+for f in $(rg --files -g '*.mjs' er-acceptance sequencer scripts); do node --check "$f"; done
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo audit --deny warnings
+cargo build-sbf --tools-version v1.52 \
+  --manifest-path programs/clober/Cargo.toml --sbf-out-dir target/deploy
+SBF_OUT_DIR=$PWD/target/deploy cargo test -p clober --all-targets
+cargo kani --package clober --features no-entrypoint
 ```
 
-This produces:
-- `target/sbf-solana-solana/release/clober.so` (or
-  `target/deploy/clober.so` via Anchor) — the BPF program binary
-- `target/idl/clober.json` — the Anchor IDL (or regenerate
-  via `anchor idl build -p clober > idl/clober.json`)
+Record the SHA-256 of the exact `target/deploy/clober.so` that passed these
+gates. Rebuilds are deployments only after the hash has been compared and
+approved by the upgrade-authority multisig.
 
-The build is clean as of Phase 2j (commit `66bde61`). Earlier
-versions of this runbook noted a `constant_time_eq` edition2024
-dependency conflict — resolved by Solana platform-tools v1.49+.
-
-## 2. Deploy
+## 2. Generate and bind a fresh program ID
 
 ```bash
-solana program deploy target/sbf-solana-solana/release/clober.so \
-  --program-id keys/clober-keypair.json
+solana-keygen new -o keys/clober-mainnet-keypair.json
+solana address -k keys/clober-mainnet-keypair.json
 ```
 
-Capture the printed program ID. The declared ID lives in
-`programs/clober/src/lib.rs::declare_id!()` and in `Anchor.toml`;
-both must match the deployed key. Current devnet ID:
-`5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq`. If you need to
-override, regenerate with `anchor keys sync` after building and
-update `tests/integration.rs::PROGRAM_ID_STR` to match (it's pinned
-at file scope for the runtime DeclaredProgramIdMismatch check).
+Update `declare_id!` in `programs/clober/src/lib.rs` and the mainnet deployment
+configuration used by the release operator to this address. Regenerate the IDL,
+re-run the full release gate above, and confirm the declared ID, binary program
+ID, generated IDL metadata, and deployment command agree. This change requires
+a full review because the program ID participates in all PDAs.
 
-## 3. Initialize protocol PDAs (one-time)
+## 3. Deploy and transfer upgrade authority
 
-These two are global and create at the program ID's PDA seeds:
-- `["insurance_fund"]`
-- `["lp_exposure"]`
-
-Using the SDK:
-
-```ts
-import { Connection, Keypair } from '@solana/web3.js';
-import { Wallet } from '@coral-xyz/anchor';
-import { CloberClient, defaultInsuranceFundParams } from './client';
-
-const conn = new Connection('https://api.devnet.solana.com');
-const authority = /* load deployer keypair */;
-const client = new CloberClient(conn, new Wallet(authority));
-
-const setupTx = await new Transaction()
-  .add(await client.initializeInsuranceFundIx(authority.publicKey, defaultInsuranceFundParams()))
-  .add(await client.initializeLiquidityPoolIx(authority.publicKey, new BN(5_000_000)));
-await sendAndConfirmTransaction(conn, setupTx, [authority]);
-```
-
-## 4. Initialize a market
-
-For each (base_mint, quote_mint) pair, plus pre-created token vaults
-and an oracle account (Pyth price account on mainnet):
-
-```ts
-import { defaultMajorMarketParams } from './client';
-
-const initTx = new Transaction().add(
-  await client.initializeMarketIx({
-    authority: authority.publicKey,
-    baseMint, quoteMint, baseVault, quoteVault, oracleAccount,
-    params: defaultMajorMarketParams(),
-    initialOracleTicks: new BN(100_000),  // starting price in ticks
-  }),
-);
-await sendAndConfirmTransaction(conn, initTx, [authority]);
-```
-
-The `defaultMajorMarketParams()` is calibrated for SOL/BTC/ETH-style
-liquid markets. Use a different param set for long-tail markets
-(narrower lot/tick, wider liq penalty, smaller LP cap per batch).
-
-## 5. Onboard the first trader
-
-```ts
-const trader = /* load trader keypair */;
-const traderClient = new CloberClient(conn, new Wallet(trader));
-
-const tx = new Transaction()
-  .add(await traderClient.openTraderStateIx(trader.publicKey))
-  .add(await traderClient.depositCollateralIx(trader.publicKey, new BN(50_000)));
-await sendAndConfirmTransaction(conn, tx, [trader]);
-```
-
-## 6. Place an order
-
-```ts
-const market = client.market(baseMint, quoteMint).address;
-await sendAndConfirmTransaction(
-  conn,
-  new Transaction().add(
-    await traderClient.placeLimitOrderIx({
-      trader: trader.publicKey,
-      market,
-      side: 'long',
-      sizeLots: new BN(10),
-      limitTicks: new BN(99_950),
-      postOnly: false,
-    }),
-  ),
-  [trader],
-);
-```
-
-The first order on a (market, trader) pair pays rent for the position
-PDA. Subsequent orders are zero-rent.
-
-## 7. Run a batch
-
-The sequencer (in production: an MagicBlock ER node; in dev: a cron
-job calling the program every 50 ms) submits:
-
-```ts
-await sendAndConfirmTransaction(
-  conn,
-  new Transaction().add(
-    await sequencerClient.runBatchIx({
-      sequencer: sequencer.publicKey,
-      market,
-      nowMs: new BN(Date.now()),
-    }),
-  ),
-  [sequencer],
-);
-```
-
-Subscribe to events to consume fills:
-
-```ts
-import { subscribeToProgramEvents } from './client';
-
-subscribeToProgramEvents(conn, (event, slot, sig) => {
-  if (event.name === 'BatchClearedEvent') {
-    console.log(`batch ${event.data.batchNum}: ${event.data.fillCount} fills`);
-  }
-});
-```
-
-For each `FillAppliedEvent` in a batch's logs, the sequencer (or any
-authorized actor) submits an `apply_fill` or `apply_lp_fill` tx to
-mutate the affected Position PDAs.
-
-## 8. Run a liquidation bot
-
-```ts
-import { previewPortfolioRisk, fetchPosition, fetchTraderState, fetchMarket } from './client';
-
-async function checkAndLiquidate(traderPk: PublicKey) {
-  const position = await fetchPosition(client, client.position(market, traderPk).address);
-  if (!position || position.sizeLots.isZero()) return;
-  const traderState = await fetchTraderState(client, client.traderState(traderPk).address);
-  const marketAcct = await fetchMarket(client, market);
-  if (!traderState || !marketAcct) return;
-
-  const preview = previewPortfolioRisk(
-    [position],
-    new Map([[market.toBase58(), marketAcct]]),
-    traderState.collateralQuoteLots.toNumber(),
-  );
-
-  if (!preview.isHealthy) {
-    // Submit liquidate_position. The on-chain matcher will re-verify and
-    // reject if the trader isn't actually unhealthy at execution time.
-    await sendAndConfirmTransaction(
-      conn,
-      new Transaction().add(
-        await client.liquidatePositionIx({
-          caller: liquidator.publicKey,
-          market,
-          trader: traderPk,
-        }),
-      ),
-      [liquidator],
-    );
-  }
-}
-```
-
-## 9. Operational pause (circuit breaker)
-
-```ts
-import { MarketStatus } from './client';
-
-await sendAndConfirmTransaction(
-  conn,
-  new Transaction().add(
-    await client.setMarketStatusIx({
-      authority: authority.publicKey,
-      market,
-      newStatus: MarketStatus.Paused,
-    }),
-  ),
-  [authority],
-);
-```
-
-Status `Paused` blocks all `place_limit_order`. Existing positions can
-be closed via `apply_fill` (no status gate) or liquidated.
-
-## 10. Authority transfer (key rotation)
-
-```ts
-await sendAndConfirmTransaction(
-  conn,
-  new Transaction().add(
-    await client.transferMarketAuthorityIx({
-      authority: authority.publicKey,
-      market,
-      newAuthority: newKey.publicKey,
-    }),
-  ),
-  [authority],
-);
-```
-
-The old authority can no longer call `update_oracle`, `set_market_status`,
-`update_market_params`, or `transfer_market_authority` again. Verified
-in `transfer_market_authority_rotates_keys` E2E test.
-
-## 11. Health monitoring
-
-Run `examples/live-monitor.ts` as a background service:
+Use an isolated signer and the approved binary:
 
 ```bash
-CLOBER_LIVE=1 \
-CLOBER_RPC=<your_rpc> \
-  bun run examples/live-monitor.ts <market_pda> <trader_pubkey>
+solana program deploy target/deploy/clober.so \
+  --program-id keys/clober-mainnet-keypair.json \
+  --url mainnet-beta
+solana program show <fresh-program-id> --url mainnet-beta
+solana program set-upgrade-authority <fresh-program-id> \
+  --new-upgrade-authority <multisig-pda> --url mainnet-beta
 ```
 
-Prints state snapshots and live-streams events with timestamps + sigs.
+Verify the deployed program-data authority is the multisig before initializing
+assets or accepting deposits. Preserve the deploy transaction, program-data
+address, binary hash, IDL hash, and multisig approval in the release record.
 
-## Acceptance gates before mainnet
+## 3.1 Publish and verify the IDL
 
-These all map to entries in `docs/SAFETY.md` § "Audit checklist":
+Publish the exact reviewed IDL only after the program deployment is final.
+Clober uses Solana's Program Metadata Program (PMP), not Anchor's deprecated
+in-program IDL upload handlers, so the full interface is published without
+adding a historical management surface to the trading program:
 
-- [x] All matcher math integer with checked overflow
-- [x] PDA seed validation on every account access
-- [x] Status circuit breaker
-- [x] Authority transfer auditable
-- [x] 17 E2E integration tests pass
-- [x] 12K-case property tests pass
-- [ ] BPF build successful (blocked upstream)
-- [ ] Mainnet shadow mode (Phase 2)
-- [ ] Independent third-party audit
+```bash
+npx --yes @solana-program/program-metadata write idl <fresh-program-id> idl/clober.json
+```
+
+Record the metadata signature and verify the stored IDL hash against the
+reviewed file. Confirm Explorer or other client tooling resolves the program
+IDL, instruction names, account names, arguments, events, and typed errors. A
+transaction is not launch evidence until its Explorer page shows the expected
+program, decoded instruction, account set, logs/events, and successful status.
+
+## 4. Initialize each approved market
+
+For every entry in `config/mainnet-markets.json`, use an IDL-driven operator
+client to perform the exact market lifecycle:
+
+1. Create verified token vault accounts for the catalog base mint and USDC
+   quote mint.
+2. Call `initialize_market` using the catalog mint, bounded `MarketParams`,
+   initial price, Pyth receiver configuration, insurance fund, and LP system.
+3. Call `init_market_book`, then `init_fill_commitment` and `init_fill_outbox`
+   with matching, production-approved capacities. A market is intentionally
+   fail-closed until the settlement ring is initialized.
+4. Initialize the selected LP accounting system, never both systems for the
+   same market. See [OPERATIONS.md](OPERATIONS.md).
+5. Configure `init_market_oracle_config`, ingest a fresh Pyth price with
+   `update_oracle_from_pyth`, then lock the oracle source once verified.
+6. Set the independent sequencer using `set_market_sequencer`, apply the
+   authority-transfer process in [OPERATIONS.md](OPERATIONS.md), and check
+   `verify_market_invariants`.
+
+The catalog contains real mainnet mints and Pyth feed IDs for BTC, ETH, SOL,
+JUP, PYTH, RAY, and BONK. It is an allow-list and parameter review input, not
+a transaction generator; confirm each mint and live oracle account on the
+target cluster immediately before signing.
+
+## 5. Admission and monitoring
+
+Keep each market closed to public flow until all of these are observed on the
+target cluster:
+
+- Pyth updates remain within the configured freshness and confidence bounds.
+- The book, fill commitment, and outbox have been initialized and produce
+  expected PDAs under the fresh program ID.
+- A controlled place, match, settlement, cancel, funding, and withdrawal path
+  succeeds; invalid authority and stale-oracle probes fail.
+- For every public instruction, execute an approved success or expected-reject
+  probe on devnet before mainnet admission. Store its signature, decoded IDL
+  instruction, account list, emitted events, compute units, and result in the
+  release record. Mainnet uses a controlled subset before public flow; do not
+  manufacture transactions solely for Explorer presentation.
+- The sequencer, oracle monitor, funding keeper, and alerting each run under
+  separately scoped keys.
+- Multisig recovery, pause, and authority-transfer drills have been recorded.
+
+Public launch requires an independent audit and an explicit multisig release
+approval. Until those external controls exist, this repository is not a
+mainnet deployment authorization.

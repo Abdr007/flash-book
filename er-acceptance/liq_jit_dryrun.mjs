@@ -83,7 +83,7 @@ await sendAs(signer, createAssociatedTokenAccountInstruction(signer.publicKey, t
 await sendAs(signer, createMintToInstruction(QUOTE, takerAta, signer.publicKey, 5000n));
 await sendAs(taker, await program.methods.depositCollateral(new BN(2600)).accountsPartial({ trader: taker.publicKey, traderState: TS, insuranceFund: INS, quoteMint: QUOTE, traderQuoteAta: takerAta, quoteVault: VAULT, tokenProgram: TOKEN_PROGRAM_ID }).instruction());
 const TPOS = pda(["position", M, TS]);
-await sendAs(taker, await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await sendAs(taker, await program.methods.placeTakerOrder(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 await sendAs(signer, await program.methods.applyLpFill(new BN(1), new BN(100000), 0, 0, new BN(1), false).accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TS, takerPosition: TPOS, lpExposure: LP, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, systemProgram: sys }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 const pos0 = await program.account.positionAccount.fetch(TPOS);
 ok(Number(pos0.sizeLots) === 1 && pos0.side === 0, `taker holds LONG ${pos0.sizeLots} @ ${pos0.entryPriceTicks} (thin collateral)`);
@@ -110,16 +110,16 @@ const CALLER_TS = pda(["trader_state", signer.publicKey]);
 try { await sendAs(signer, await program.methods.openTraderState().accountsPartial({ trader: signer.publicKey, traderState: CALLER_TS, systemProgram: sys }).instruction()); } catch { /* already exists */ }
 let liqSig = "", liqErr = "";
 try {
-  liqSig = await sendAs(signer, await program.methods.liquidatePositionV2(new BN(0)).accountsPartial({ caller: signer.publicKey, market: M, marketBook: BOOK, traderState: TS, callerTraderState: CALLER_TS, position: TPOS, systemProgram: sys }).remainingAccounts([{ pubkey: IN_OFFER, isWritable: true, isSigner: false }, { pubkey: OOB_OFFER, isWritable: true, isSigner: false }]).instruction());
+  liqSig = await sendAs(signer, await program.methods.liquidatePosition(new BN(0)).accountsPartial({ caller: signer.publicKey, market: M, marketBook: BOOK, traderState: TS, callerTraderState: CALLER_TS, position: TPOS, systemProgram: sys }).remainingAccounts([{ pubkey: IN_OFFER, isWritable: true, isSigner: false }, { pubkey: OOB_OFFER, isWritable: true, isSigner: false }]).instruction());
 } catch (e) { liqErr = String(e.message || e).slice(0, 160); }
-ok(liqSig !== "", `liquidate_position_v2 SETTLED${liqSig ? " — " + liqSig : " — got: " + liqErr}`);
+ok(liqSig !== "", `liquidate_position SETTLED${liqSig ? " — " + liqSig : " — got: " + liqErr}`);
 
 // ── Verify: in-band offer CONSUMED, out-of-band offer UNTOUCHED. ─────────────
 console.log("\n5) verify the JIT auction selected the in-band offer and rejected the out-of-band one");
 const inAfter = await program.account.jitLiquidationOfferAccount.fetch(IN_OFFER);
 const oobAfter = await program.account.jitLiquidationOfferAccount.fetch(OOB_OFFER);
 ok(Number(inAfter.remainingSizeLots) === 0, `in-band offer CONSUMED (remaining ${inAfter.remainingSizeLots} == 0) — auction deserialized + selected it on-chain (impossible pre-fix)`);
-ok(Number(oobAfter.remainingSizeLots) === 1, `out-of-band offer REJECTED (remaining ${oobAfter.remainingSizeLots} == 1) — H-1 bound held`);
+ok(Number(oobAfter.remainingSizeLots) === 1, `out-of-band offer REJECTED (remaining ${oobAfter.remainingSizeLots} == 1) — permissionless-solvency bound held`);
 
 console.log(`\n${fail === 0 ? "✅ LIQUIDATION JIT DRY-RUN PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

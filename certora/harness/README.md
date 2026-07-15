@@ -48,10 +48,10 @@ certoraRun certora/solana_solvency.conf
 
 deposit_collateral, withdraw_collateral, partial_withdraw_collateral,
 sweep_collateral, lp_deposit, lp_withdraw,
-withdraw_insurance_fund, settle_funding, apply_fill, liquidate_position_v2,
-liquidate_portfolio_v2, vault_place_order_v3, vault_cancel_order_v3,
-settle_vault_perf_fee_v3, lp_deposit_v3, lp_withdraw_v3, mature_position,
-convert_position, cancel_order_v2.
+withdraw_insurance_fund, settle_funding, apply_fill, liquidate_position,
+liquidate_portfolio, vault_place_order, vault_cancel_order,
+settle_vault_perf_fee, lp_market_deposit, lp_market_withdraw, mature_position,
+convert_position, cancel_order.
 
 Every other handler is a view/admin/order-book op that does not move value across
 the vault boundary and is closed trivially by `rule solvencyPreserved`.

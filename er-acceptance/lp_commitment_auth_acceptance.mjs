@@ -1,7 +1,7 @@
-// LP hardening H-2 LIVE (devnet): on an ARMED market, apply_lp_fill via the
+// LP hardening commitment-authentication LIVE (devnet): on an ARMED market, apply_lp_fill via the
 // SEQUENCER path with NO fill-commitment must be REJECTED (Unauthorized) — the
 // ring is mandatory. This is the closed sequencer-LP-fabrication channel, on the
-// real chain. (The ring path itself is exercised by hlp_acceptance.mjs.)
+// real chain. (The ring path itself is exercised by liquidity_pool_acceptance.mjs.)
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -32,7 +32,7 @@ const sendAs = async (kp, ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`LP H-2 live acceptance — L1=${L1_RPC}\n`);
+console.log(`LP commitment-authentication live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
@@ -65,11 +65,11 @@ try {
   detail = String(e.message || e).slice(0, 60);
   if (!rejected) { const m = String(e.message||e).match(/Transaction\s+([1-9A-HJ-NP-Za-km-z]{40,})/); if (m) { try { const t = await l1.getTransaction(m[1], {maxSupportedTransactionVersion:0, commitment:"confirmed"}); rejected = /0x1bbc|Unauthorized|7100/i.test((t?.meta?.logMessages||[]).join(" ")); } catch {} } }
 }
-ok(rejected, `armed market REJECTS the sequencer LP path without a ring (H-2: fabrication channel closed)${rejected?"":" — got: "+detail}`);
+ok(rejected, `armed market REJECTS the sequencer LP path without a ring (commitment-authentication: fabrication channel closed)${rejected?"":" — got: "+detail}`);
 
 // position must NOT have been created
 const posAcct = await l1.getAccountInfo(TPOS);
 ok(posAcct === null, "no taker position created — the fabricated fill was rejected before settlement");
 
-console.log(`\n${fail === 0 ? "✅ LP H-2 LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ LP commitment-authentication LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

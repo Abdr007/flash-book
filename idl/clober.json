@@ -1,5 +1,5 @@
 {
-  "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq",
+  "address": "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z",
   "metadata": {
     "name": "clober",
     "version": "0.1.0",
@@ -112,7 +112,7 @@
         "JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads",
         "this from the order's stored flags. When true, the maker earns",
         "`market.params.jit_bonus_rebate_bps` extra rebate on top of the",
-        "base maker_rebate_bps. Passing false preserves legacy behaviour."
+        "base maker_rebate_bps. Passing false preserves default behaviour."
       ],
       "discriminator": [
         201,
@@ -1043,11 +1043,11 @@
     {
       "name": "cancel_all",
       "docs": [
-        "V2 cancel-all: remove every resting order owned by the caller in",
+        "native cancel-all: remove every resting order owned by the caller in",
         "this market. Walks both bid and ask RBTs, collecting indices of",
         "orders whose `trader == caller`, then removes each in two",
         "passes (read-only walk → mutating removes). The walk is bounded",
-        "by `MAX_CANCELS_PER_IX_V2 = 24`: a single tx that triggers more",
+        "by `MAX_CANCELLATIONS_PER_INSTRUCTION = 24`: a single tx that triggers more",
         "cancels would risk the BPF CU budget. Traders with many resting",
         "orders simply call this ix repeatedly until `cancelled_count == 0`.",
         "",
@@ -1222,7 +1222,7 @@
     {
       "name": "cancel_iceberg",
       "docs": [
-        "Cancel a v3 iceberg and close the account."
+        "Cancel a iceberg and close the account."
       ],
       "discriminator": [
         199,
@@ -1316,14 +1316,14 @@
     {
       "name": "cancel_order",
       "docs": [
-        "V2 cancel: remove a resting order from the hypertree. Validates",
+        "native cancel: remove a resting order from the hypertree. Validates",
         "that the caller is the original trader (orders carry the trader",
-        "pubkey inline). Refunds no SPL tokens — the v2 book holds no escrow;",
+        "pubkey inline). Refunds no SPL tokens — the native book holds no escrow;",
         "collateral never leaves the trader's account on placement.",
         "",
         "The off-chain SDK derives `order_id` via",
         "`encode_order_id(price_ticks, seq, side == 0)` from the",
-        "`OrderPlacedV2Event` fields."
+        "`OrderPlacedEvent` fields."
       ],
       "discriminator": [
         95,
@@ -1412,21 +1412,21 @@
       ]
     },
     {
-      "name": "cancel_order_v2_session",
+      "name": "cancel_order_session",
       "docs": [
         "SESSION-KEY cancel (additive): an ephemeral `session_signer` cancels an",
         "order owned by `session_token.owner` (verified + unexpired). Same core",
-        "logic via `cancel_v2_core`; only the identity source differs."
+        "logic via `cancel_order_core`; only the identity source differs."
       ],
       "discriminator": [
+        195,
+        201,
         36,
-        186,
-        245,
-        60,
-        149,
-        208,
-        80,
-        108
+        205,
+        8,
+        32,
+        29,
+        11
       ],
       "accounts": [
         {
@@ -1616,7 +1616,7 @@
     {
       "name": "cancel_trigger_order",
       "docs": [
-        "Cancel a v3 trigger and close the account, refunding rent."
+        "Cancel a trigger and close the account, refunding rent."
       ],
       "discriminator": [
         144,
@@ -1644,7 +1644,7 @@
     {
       "name": "cancel_twap_order",
       "docs": [
-        "Cancel a v3 TWAP order and close the account."
+        "Cancel a TWAP order and close the account."
       ],
       "discriminator": [
         23,
@@ -1891,12 +1891,6 @@
     {
       "name": "clear_book_delegation",
       "docs": [
-        "Update market status (authority-only).",
-        "",
-        "Status transitions:",
-        "Active → PostOnly: existing positions trade; new takers blocked",
-        "Active → Paused:   no order intake; existing positions held",
-        "Any → Closed:      terminal sunset; only liquidation + close",
         "Clear the `book_delegated` flag once the market's book is back on L1",
         "(undelegated). Authority-gated. Until called, the flag stays `true` and",
         "order placement keeps requiring the armed lock — fail closed, never a",
@@ -2142,158 +2136,6 @@
         {
           "name": "permission_program",
           "address": "ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1"
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "close_legacy_lp_accounts",
-      "docs": [
-        "One-time migration for deployments that predate the pool-singleton",
-        "seed rename (`flp_exposure` → `lp_exposure`): the singleton moved to",
-        "a new PDA but the treasury `LpPositionAccount` seed did not, so a",
-        "pre-rename treasury survives at the exact address",
-        "`initialize_liquidity_pool` must `init` — permanently wedging pool",
-        "(re)initialization. Closes the stranded treasury position and drains",
-        "the orphaned pre-rename singleton, refunding rent to the authority.",
-        "",
-        "Only legal while the canonical `lp_exposure` singleton does NOT",
-        "exist (`AlreadyInitialized` otherwise): once the pool is live, the",
-        "same seeds address the LIVE treasury endowment, which must never be",
-        "closeable."
-      ],
-      "discriminator": [
-        125,
-        234,
-        171,
-        30,
-        49,
-        13,
-        25,
-        85
-      ],
-      "accounts": [
-        {
-          "name": "authority",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "insurance_fund",
-          "docs": [
-            "Admin-gated exactly like `initialize_liquidity_pool`: only the",
-            "insurance-fund authority may run the migration."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  105,
-                  110,
-                  115,
-                  117,
-                  114,
-                  97,
-                  110,
-                  99,
-                  101,
-                  95,
-                  102,
-                  117,
-                  110,
-                  100
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "lp_exposure",
-          "docs": [
-            "handler gates on it (seeds pin the address; owner/data checked there)."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  108,
-                  112,
-                  95,
-                  101,
-                  120,
-                  112,
-                  111,
-                  115,
-                  117,
-                  114,
-                  101
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "legacy_treasury_position",
-          "docs": [
-            "The stranded pre-rename treasury endowment; rent refunds to the",
-            "authority. Typed, so discriminator + seeds bind it to a real",
-            "`LpPositionAccount` owned by this program."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  108,
-                  112,
-                  95,
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "authority"
-              }
-            ]
-          }
-        },
-        {
-          "name": "legacy_flp_exposure",
-          "docs": [
-            "PDA; seeds pin the address, the handler checks program ownership."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  102,
-                  108,
-                  112,
-                  95,
-                  101,
-                  120,
-                  112,
-                  111,
-                  115,
-                  117,
-                  114,
-                  101
-                ]
-              }
-            ]
-          }
         }
       ],
       "args": []
@@ -3220,7 +3062,7 @@
         "Front-run-safe: the market PDA is keyed by `(base_mint, quote_mint)`, and",
         "because the params are envelope-clamped, whoever wins the create race",
         "produces an equally-safe market. Like the authority path it is fail-closed",
-        "(`fill_commitment_required = true`) until the creator arms it with a ring."
+        "until the creator initializes its commitment ring."
       ],
       "discriminator": [
         209,
@@ -3557,7 +3399,7 @@
         },
         {
           "name": "owner_program",
-          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+          "address": "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
         },
         {
           "name": "delegate_buffer",
@@ -3680,7 +3522,7 @@
         },
         {
           "name": "owner_program",
-          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+          "address": "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
         },
         {
           "name": "delegate_buffer",
@@ -3757,7 +3599,7 @@
         },
         {
           "name": "owner_program",
-          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+          "address": "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
         },
         {
           "name": "delegate_buffer",
@@ -3796,7 +3638,7 @@
     {
       "name": "delegate_market_book",
       "docs": [
-        "Delegate the v2 hypertree market_book PDA to the MagicBlock ER.",
+        "Delegate the hypertree market_book PDA to the MagicBlock ER.",
         "After this lands, the account state lives on the ER for sub-ms",
         "matcher access; only this program (via PDA signature) can",
         "undelegate it back to mainnet. The market account must also be",
@@ -3897,7 +3739,7 @@
             "MagicBlock delegation program). Verified inside cpi_delegate via",
             "the program ID match. Constraint pins it to this crate's program ID."
           ],
-          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+          "address": "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
         },
         {
           "name": "delegate_buffer",
@@ -4771,7 +4613,7 @@
     {
       "name": "execute_trigger_order",
       "docs": [
-        "Execute a v3 trigger — validates fire condition then injects the",
+        "Execute a trigger — validates fire condition then injects the",
         "resulting limit order into the hypertree directly (no CPI). The",
         "caller is permissionless; trader was pre-authorized at placement."
       ],
@@ -4924,7 +4766,7 @@
     {
       "name": "expand_market_book",
       "docs": [
-        "Grow an existing v2 `market_book` PDA in place by `additional_nodes`",
+        "Grow an existing native `market_book` PDA in place by `additional_nodes`",
         "hypertree slots — this is what breaks the 100-node init cap. Only the",
         "market authority may call it (same gate as `init_market_book`).",
         "",
@@ -5376,7 +5218,7 @@
         },
         {
           "name": "owner_program",
-          "address": "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+          "address": "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
         },
         {
           "name": "delegate_buffer",
@@ -6666,9 +6508,9 @@
     {
       "name": "init_market_book",
       "docs": [
-        "Initialize the v2 hypertree-backed orderbook for a market.",
+        "Initialize the hypertree-backed orderbook for a market.",
         "Allocates a fresh PDA at `[b\"market_book\", market]` of exactly",
-        "MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the v2 discriminator,",
+        "MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the native discriminator,",
         "and writes an empty header with all RBT root indices = NIL.",
         "",
         "This is the foundation for the wave-18 orderbook rewrite. The",
@@ -7896,7 +7738,7 @@
     {
       "name": "liquidate_position",
       "docs": [
-        "V2: liquidate an unhealthy position by injecting a synthetic",
+        "native: liquidate an unhealthy position by injecting a synthetic",
         "close order into the hypertree-backed book.",
         "",
         "Applies the liquidation pipeline: cooldown gate, stress-lattice",
@@ -7904,8 +7746,8 @@
         "limit pricing, and position timing updates, injecting the close",
         "order into the hypertree book. The order_type byte is set",
         "to 3 (Liquidation) so the matcher's FIFO mapping (mirror of",
-        "v1's `slot_to_order`) places it AHEAD of regular limits at",
-        "the same price tier — same priority semantics as v1."
+        "current's `slot_to_order`) places it AHEAD of regular limits at",
+        "the same price tier — same priority semantics as current."
       ],
       "discriminator": [
         187,
@@ -8235,7 +8077,7 @@
           "name": "lp_mode",
           "docs": [
             "Protocol-wide LP-system lock. Created on the first LP-share mint of",
-            "either system; the singleton and the per-market v3 pool are then mutually",
+            "either system; the singleton and the per-market per-market pool are then mutually",
             "exclusive on minting shares (they redeem from one vault)."
           ],
           "writable": true,
@@ -8519,8 +8361,8 @@
         {
           "name": "lp_mode",
           "docs": [
-            "Protocol-wide LP-system lock (see `lp_deposit`). Claimed for v3",
-            "on the first v3 share mint; rejects if the singleton already holds shares."
+            "Protocol-wide LP-system lock (see `lp_deposit`). Claimed for native",
+            "on the first native share mint; rejects if the singleton already holds shares."
           ],
           "writable": true,
           "pda": {
@@ -8869,13 +8711,13 @@
     {
       "name": "lp_post_maker_order",
       "docs": [
-        "HLP (pool-backed CLOB), increment 1b — post a resting LP maker quote onto",
+        "Post a resting liquidity-pool maker quote onto",
         "the book, owned by the pool (`trader = lp_exposure` PDA). A taker crossing",
         "it becomes a normal ring-committed BOOK fill (maker = the LP PDA), settled",
         "by the LP-maker settlement path — so the pool provides on-book liquidity",
         "that real MMs can improve on (a pool-backed passive maker, solving CLOB",
-        "cold-start). Authority-gated for now (the on-chain quoter drives this in a",
-        "later increment); POST-ONLY by construction — an LP quote must REST, so it",
+        "cold-start). Authority-gated; the on-chain quoter owns the refresh path.",
+        "POST-ONLY by construction — an LP quote must REST, so it",
         "is rejected if it would cross the opposite best (that would make the pool a",
         "taker against its own book). Moves no capital: pure book insertion."
       ],
@@ -8997,7 +8839,7 @@
     {
       "name": "lp_refresh_quotes",
       "docs": [
-        "HLP (increment 2) — refresh the pool's on-book quotes. Reads the oracle +",
+        "Refresh the liquidity pool's on-book quotes. Reads the oracle +",
         "LP inventory and runs the SAME deterministic `lp_quoter::generate_quotes`",
         "the view exposes (Avellaneda-Stoikov inventory skew + spread model), then",
         "CANCELS the pool's stale resting quotes and POSTS the fresh two-sided",
@@ -9473,219 +9315,9 @@
       "args": []
     },
     {
-      "name": "migrate_market_layout",
-      "docs": [
-        "Migrate a market account from the legacy 1024-B mark-engine layout",
-        "to the extended 1152-B layout, which added `last_mark_settle_slot` plus",
-        "four mark-engine params (mark_ema_alpha_bps, mark_max_change_bps,",
-        "mark_settle_min_slots, drift_alert_bps).",
-        "",
-        "Idempotent: if the account is already at the extended-layout size and the mark-engine",
-        "params look set, returns Ok with a log message and no state change.",
-        "",
-        "Authority-gated: only `market.authority` may call."
-      ],
-      "discriminator": [
-        188,
-        113,
-        51,
-        120,
-        70,
-        24,
-        102,
-        181
-      ],
-      "accounts": [
-        {
-          "name": "authority",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "docs": [
-            "and gate by `authority == market.authority` inside the handler.",
-            "Owner-checked: must be owned by this program (the discriminator check",
-            "inside the handler validates it's actually a Market account)."
-          ],
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "migrate_position_to_trader_state_key",
-      "docs": [
-        "Migrate a Position from the legacy PDA `[POS_SEED, market, wallet]`",
-        "to the canonical PDA `[POS_SEED, market, trader_state.key()]`. The",
-        "trader-state-keyed derivation makes sub-account positions distinct",
-        "from main, which is the prerequisite for sub-account trading.",
-        "",
-        "Per (wallet, market). Only legacy wallet-keyed positions need",
-        "migration — sub-account positions only ever exist at the canonical",
-        "derivation. The legacy PDA is closed and rent refunded to the trader. The new PDA is",
-        "init'd with the same on-chain state (size, side, entry, funding",
-        "indices, realized PnL, isolated collateral, timing fields).",
-        "",
-        "Idempotent in the sense that calling it a second time fails",
-        "because the legacy PDA no longer exists at the old address;",
-        "callers can safely re-run after partial failure."
-      ],
-      "discriminator": [
-        208,
-        149,
-        28,
-        59,
-        151,
-        65,
-        226,
-        45
-      ],
-      "accounts": [
-        {
-          "name": "trader",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "trader_state",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  101
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
-        },
-        {
-          "name": "legacy_position",
-          "docs": [
-            "LEGACY position at `[POS_SEED, market, wallet]`. Closed by this",
-            "ix; rent refunded to `trader`."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              },
-              {
-                "kind": "account",
-                "path": "trader"
-              }
-            ]
-          }
-        },
-        {
-          "name": "new_position",
-          "docs": [
-            "NEW position at the canonical trader-state-keyed PDA. `init` (not",
-            "init_if_needed) so",
-            "migration can only run when the new slot is empty — protects",
-            "against accidental double-migration overwriting state."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  115,
-                  105,
-                  116,
-                  105,
-                  111,
-                  110
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              },
-              {
-                "kind": "account",
-                "path": "trader_state"
-              }
-            ]
-          }
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": []
-    },
-    {
       "name": "modify_order",
       "docs": [
-        "V2 modify: atomic cancel + place in one ix. Cheaper than two",
+        "native modify: atomic cancel + place in one ix. Cheaper than two",
         "separate txs (one signature, one set of account-load costs)",
         "and preserves the trader's intent across the cancel window —",
         "no chance of being filled between the cancel and the replacement.",
@@ -9695,7 +9327,7 @@
         "BEFORE removing the old order so a malformed modify doesn't",
         "silently drop the original. The new order receives a fresh",
         "`seq` from the header's monotonic counter; off-chain consumers",
-        "must re-derive the order_id from the emitted `OrderModifiedV2Event`."
+        "must re-derive the order_id from the emitted `OrderModifiedEvent`."
       ],
       "discriminator": [
         47,
@@ -9868,6 +9500,13 @@
     },
     {
       "name": "open_trader_sub_account",
+      "docs": [
+        "Create a trader-owned isolated sub-account at `sub_index` (1 through",
+        "255). Index 0 is reserved for `open_trader_state`. Each sub-account has",
+        "independent collateral, positions, delegate, and canonical PDA, so a",
+        "strategy cannot substitute another sub-account during trading or",
+        "settlement."
+      ],
       "discriminator": [
         158,
         58,
@@ -9915,7 +9554,7 @@
         "anti-deposit-then-withdraw guard prevents a trader from",
         "temporarily topping up to satisfy IM, placing a trade, then",
         "immediately yanking the temporary collateral leaving only",
-        "enough for maintenance margin (a known footgun in v1",
+        "enough for maintenance margin (a known footgun in current",
         "systems that gate only on IM)",
         "",
         "remaining_accounts layout: alternating (market, position) pairs",
@@ -10711,7 +10350,7 @@
     {
       "name": "place_iceberg_order",
       "docs": [
-        "Create a v3 iceberg + seed first visible chunk directly into the",
+        "Create a iceberg + seed first visible chunk directly into the",
         "hypertree."
       ],
       "discriminator": [
@@ -10935,7 +10574,7 @@
         "4.3: place a LADDER of `num_levels` resting limit orders in one instruction —",
         "`size_per_level` at each of `base_limit_ticks`, `base ± price_step_ticks`, … moving",
         "AWAY from the mid (bids step DOWN, asks step UP). Each rung is a full",
-        "`place_limit_v2_core`, so every per-order gate (tick / 5-sig-fig / min-notional /",
+        "`place_limit_core`, so every per-order gate (tick / 5-sig-fig / min-notional /",
         "anti-stuffing band / OI cap / intake margin) applies to each rung independently and a",
         "rung that fails (e.g. steps out of band) aborts the whole ladder. Opening liquidity",
         "tool: `reduce_only` is not allowed here (each rung would need its own reducible-size",
@@ -11066,7 +10705,7 @@
       "name": "place_limit_order",
       "docs": [
         "Limit-order placement against the hypertree-backed orderbook — the sole",
-        "limit-placement path (the legacy order-buffer book was removed; every",
+        "limit-placement path (the default order-buffer book was removed; every",
         "market is initialized with `init_market_book`).",
         "",
         "Intake: status-active gate, min-base-lots, tick alignment, size cap. Then",
@@ -11189,23 +10828,23 @@
       ]
     },
     {
-      "name": "place_limit_order_v2_session",
+      "name": "place_limit_order_session",
       "docs": [
         "SESSION-KEY path (additive): an ephemeral `session_signer` places an order",
         "for `session_token.owner` (verified + unexpired), so a client trading on",
         "the ER need not sign every order with the cold wallet. IDENTICAL matching",
-        "logic to `place_limit_order` — both call the same `place_limit_v2_core`,",
+        "logic to `place_limit_order` — both call the same `place_limit_core`,",
         "differing only in how the trader identity is authenticated."
       ],
       "discriminator": [
-        158,
-        209,
-        45,
-        26,
-        220,
-        65,
-        110,
-        180
+        23,
+        113,
+        10,
+        184,
+        255,
+        162,
+        21,
+        77
       ],
       "accounts": [
         {
@@ -11475,7 +11114,7 @@
     {
       "name": "place_trigger_order",
       "docs": [
-        "Create a v3 trigger order PDA. Same trigger semantics as",
+        "Create a trigger order PDA. Same trigger semantics as",
         "`execute_trigger_order` (validates side / kind / size / price /",
         "tick alignment / expiry).",
         "PDA seeds: `[b\"trigger\", market, trader, trigger_id]`."
@@ -11557,7 +11196,7 @@
     {
       "name": "place_twap_order",
       "docs": [
-        "Create a v3 TWAP order PDA."
+        "Create a TWAP order PDA."
       ],
       "discriminator": [
         0,
@@ -12362,7 +12001,7 @@
     {
       "name": "replenish_iceberg",
       "docs": [
-        "Replenish v3 iceberg's next chunk — permissionless keeper."
+        "Replenish iceberg's next chunk — permissionless keeper."
       ],
       "discriminator": [
         69,
@@ -12616,13 +12255,13 @@
       "docs": [
         "keeper/authority retirement of a stranded",
         "liquidation-close order. The OWNER cannot cancel an `order_type == 3` order",
-        "(`cancel_v2_core` / `cancel_all` — that closes the liquidation-dodge), so a",
+        "(`cancel_order_core` / `cancel_all` — that closes the liquidation-dodge), so a",
         "legitimate path must exist to clear one that never filled (e.g. the position",
         "recovered or was closed by other means, leaving the synthetic close resting).",
         "Gated to the market `sequencer` (the settlement keeper that drives liquidation)",
         "or the market `authority` — NEVER the owner. ONLY `order_type == 3` is retirable",
         "here: this is not a general keeper-cancel bypass. Reuses the same book-removal",
-        "plumbing as `cancel_v2_core`."
+        "plumbing as `cancel_order_core`."
       ],
       "discriminator": [
         222,
@@ -13514,6 +13153,12 @@
     },
     {
       "name": "set_market_status",
+      "docs": [
+        "Set market operating status. The market authority may select any valid",
+        "transition except reopening a terminally closed market. A configured",
+        "guardian may only tighten a live market to PostOnly, Paused, or Closed;",
+        "it can never loosen risk controls or reopen trading."
+      ],
       "discriminator": [
         101,
         175,
@@ -13604,7 +13249,7 @@
         "Calibrate a market's per-asset stress tier (Phase 1). Sets the margin",
         "`stress_shock_bps` (scales the margin lattice ⇒ tiered leverage) and the",
         "`backstop_tail_bps` (the black-swan gap the insurance fund underwrites).",
-        "Authority-only, bounded, opt-in, and REVERSIBLE (both 0 ⇒ full legacy",
+        "Authority-only, bounded, opt-in, and REVERSIBLE (both 0 ⇒ full default",
         "±30% margin + 30% tail, the off-switch).",
         "",
         "Validated BEFORE any write, so leverage never outruns the fund:",
@@ -15133,7 +14778,7 @@
         "pairs in remaining_accounts (count must equal source.open_positions).",
         "Post-sweep margin is evaluated against the joint stress-lattice;",
         "rejects if the source would become unhealthy after the withdrawal.",
-        "Source flat → pass `[]` for remaining_accounts (the legacy fast path).",
+        "Source flat → pass `[]` for remaining_accounts (the default fast path).",
         "",
         "Cannot sweep to/from the same account."
       ],
@@ -15481,7 +15126,7 @@
       "docs": [
         "Immediate market-params update — RESTRICTED.",
         "",
-        "This path may perform exactly ONE change: ENABLING a disabled (legacy,",
+        "This path may perform exactly ONE change: ENABLING a disabled (default,",
         "pre-bound-era) oracle-staleness gate — when the market's current",
         "`oracle_staleness_max_seconds == 0`, set it to a sane value in",
         "`[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]`. Every OTHER",
@@ -16058,101 +15703,6 @@
           }
         }
       ]
-    },
-    {
-      "name": "upgrade_fill_commitment",
-      "docs": [
-        "One-way, authority-gated upgrade of a market's",
-        "fill-commitment ring from the v0 layout to v1, enabling per-position",
-        "reduce-in-flight tracking, closing the last reduce-only edge: a position",
-        "shrunk below its resting reduce-only size, then over-crossed across the",
-        "match→settle gap.",
-        "MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is",
-        "owned by the delegation program — realloc would be illegal) and the ring",
-        "DRAINED (`produced == settled`; a pending fill would be left without a reduce",
-        "flag — `buffer_upgrade_to` enforces this). Re-running on a v1 ring reverts."
-      ],
-      "discriminator": [
-        161,
-        149,
-        17,
-        132,
-        230,
-        40,
-        194,
-        105
-      ],
-      "accounts": [
-        {
-          "name": "authority",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "market",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  97,
-                  114,
-                  107,
-                  101,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market.base_mint",
-                "account": "MarketAccount"
-              },
-              {
-                "kind": "account",
-                "path": "market.quote_mint",
-                "account": "MarketAccount"
-              }
-            ]
-          }
-        },
-        {
-          "name": "fill_commitment",
-          "docs": [
-            "which re-asserts program ownership before growing. Bound by the seeds."
-          ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  102,
-                  105,
-                  108,
-                  108,
-                  95,
-                  99,
-                  111,
-                  109,
-                  109,
-                  105,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "market"
-              }
-            ]
-          }
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": []
     },
     {
       "name": "vault_cancel_order",
@@ -16955,7 +16505,7 @@
           "name": "haircut_state",
           "docs": [
             "Optional — when supplied, its `residual` is checked",
-            "to be backed by the vault surplus. `None` = legacy behavior (backward",
+            "to be backed by the vault surplus. `None` = default behavior (backward",
             "compatible; existing callers are unaffected)."
           ],
           "optional": true
@@ -17257,10 +16807,10 @@
     {
       "name": "view_book_depth",
       "docs": [
-        "V2 read-side: emit the top-N levels of the hypertree-backed book",
+        "native read-side: emit the top-N levels of the hypertree-backed book",
         "as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`",
         "and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single",
-        "`BookDepthV2Event`. Pure read — never mutates state.",
+        "`BookDepthEvent`. Pure read — never mutates state.",
         "",
         "This is the wave-18e validation that the RBT iteration is correct:",
         "after a series of `place_limit_order` calls, the bids-best-first",
@@ -18717,29 +18267,29 @@
       ]
     },
     {
-      "name": "BasketOrderNPlacedV2Event",
+      "name": "BasketOrderNPlacedEvent",
       "discriminator": [
-        157,
-        20,
-        152,
-        178,
-        42,
-        205,
-        112,
-        236
+        19,
+        153,
+        141,
+        135,
+        48,
+        6,
+        0,
+        31
       ]
     },
     {
-      "name": "BasketOrderPlacedV2Event",
+      "name": "BasketOrderPlacedEvent",
       "discriminator": [
-        123,
-        236,
-        203,
-        13,
-        56,
-        1,
-        128,
-        118
+        118,
+        31,
+        155,
+        161,
+        181,
+        196,
+        176,
+        249
       ]
     },
     {
@@ -18756,16 +18306,16 @@
       ]
     },
     {
-      "name": "BookDepthV2Event",
+      "name": "BookDepthEvent",
       "discriminator": [
-        223,
-        44,
-        226,
-        111,
-        32,
-        147,
-        9,
-        112
+        130,
+        49,
+        135,
+        203,
+        85,
+        50,
+        158,
+        88
       ]
     },
     {
@@ -18795,16 +18345,16 @@
       ]
     },
     {
-      "name": "BracketOrderV3PlacedEvent",
+      "name": "BracketOrderPlacedEvent",
       "discriminator": [
-        210,
-        69,
-        229,
-        26,
-        136,
-        172,
-        86,
-        14
+        232,
+        177,
+        78,
+        57,
+        80,
+        82,
+        178,
+        217
       ]
     },
     {
@@ -18821,16 +18371,16 @@
       ]
     },
     {
-      "name": "BulkOrderCancelledV2Event",
+      "name": "BulkOrderCancelledEvent",
       "discriminator": [
-        242,
-        6,
+        71,
         116,
-        84,
-        67,
-        225,
-        168,
-        198
+        180,
+        127,
+        91,
+        194,
+        36,
+        183
       ]
     },
     {
@@ -19107,19 +18657,6 @@
       ]
     },
     {
-      "name": "FillCommitmentUpgradedV1Event",
-      "discriminator": [
-        225,
-        245,
-        213,
-        177,
-        102,
-        122,
-        99,
-        99
-      ]
-    },
-    {
       "name": "FillOutboxDelegatedEvent",
       "discriminator": [
         138,
@@ -19263,42 +18800,42 @@
       ]
     },
     {
-      "name": "IcebergOrderV3PlacedEvent",
+      "name": "IcebergCancelledEvent",
       "discriminator": [
-        169,
-        35,
-        97,
-        87,
+        64,
+        48,
+        178,
+        46,
+        191,
+        188,
+        230,
+        62
+      ]
+    },
+    {
+      "name": "IcebergOrderPlacedEvent",
+      "discriminator": [
         165,
-        79,
-        193,
-        235
+        166,
+        133,
+        184,
+        247,
+        83,
+        30,
+        73
       ]
     },
     {
-      "name": "IcebergV3CancelledEvent",
+      "name": "IcebergReplenishedEvent",
       "discriminator": [
-        128,
-        31,
-        183,
+        213,
+        34,
+        135,
+        222,
+        239,
+        109,
         70,
-        139,
-        156,
-        121,
-        25
-      ]
-    },
-    {
-      "name": "IcebergV3ReplenishedEvent",
-      "discriminator": [
-        254,
-        189,
-        111,
-        154,
-        108,
-        227,
-        99,
-        0
+        217
       ]
     },
     {
@@ -19380,19 +18917,6 @@
       ]
     },
     {
-      "name": "LegacyLpAccountsClosedEvent",
-      "discriminator": [
-        169,
-        156,
-        39,
-        205,
-        153,
-        190,
-        201,
-        252
-      ]
-    },
-    {
       "name": "LiqRestoreBufferSetEvent",
       "discriminator": [
         164,
@@ -19406,16 +18930,16 @@
       ]
     },
     {
-      "name": "LiquidationInjectedV2Event",
+      "name": "LiquidationInjectedEvent",
       "discriminator": [
-        159,
-        181,
-        246,
-        31,
-        120,
-        154,
-        24,
-        50
+        164,
+        140,
+        71,
+        160,
+        135,
+        126,
+        192,
+        166
       ]
     },
     {
@@ -19731,19 +19255,6 @@
       ]
     },
     {
-      "name": "MarketMigratedToV3Event",
-      "discriminator": [
-        225,
-        72,
-        182,
-        104,
-        4,
-        51,
-        67,
-        14
-      ]
-    },
-    {
       "name": "MarketOracleConfigInitializedEvent",
       "discriminator": [
         12,
@@ -19887,42 +19398,42 @@
       ]
     },
     {
-      "name": "OrderCancelledV2Event",
+      "name": "OrderCancelledEvent",
       "discriminator": [
-        143,
-        55,
-        206,
-        4,
-        22,
-        91,
-        9,
-        150
-      ]
-    },
-    {
-      "name": "OrderModifiedV2Event",
-      "discriminator": [
-        184,
-        17,
-        43,
-        88,
-        64,
-        130,
-        35,
-        9
-      ]
-    },
-    {
-      "name": "OrderPlacedV2Event",
-      "discriminator": [
-        45,
-        52,
-        178,
-        220,
+        200,
+        73,
+        179,
+        145,
         247,
-        196,
-        144,
-        105
+        176,
+        10,
+        101
+      ]
+    },
+    {
+      "name": "OrderModifiedEvent",
+      "discriminator": [
+        12,
+        55,
+        65,
+        103,
+        147,
+        101,
+        208,
+        114
+      ]
+    },
+    {
+      "name": "OrderPlacedEvent",
+      "discriminator": [
+        245,
+        198,
+        202,
+        247,
+        110,
+        231,
+        254,
+        156
       ]
     },
     {
@@ -20092,19 +19603,6 @@
         72,
         144,
         72
-      ]
-    },
-    {
-      "name": "PositionMigratedEvent",
-      "discriminator": [
-        52,
-        72,
-        109,
-        53,
-        108,
-        189,
-        48,
-        169
       ]
     },
     {
@@ -20381,107 +19879,107 @@
       ]
     },
     {
-      "name": "TriggerOrderV3CancelledEvent",
+      "name": "TriggerOrderCancelledEvent",
       "discriminator": [
-        35,
-        24,
-        82,
-        174,
-        122,
-        90,
-        203,
-        134
-      ]
-    },
-    {
-      "name": "TriggerOrderV3ExecutedEvent",
-      "discriminator": [
+        178,
         127,
+        39,
+        234,
+        87,
+        193,
+        7,
+        119
+      ]
+    },
+    {
+      "name": "TriggerOrderExecutedEvent",
+      "discriminator": [
+        91,
+        152,
+        148,
         83,
-        57,
-        224,
-        133,
-        78,
-        217,
-        7
+        160,
+        39,
+        39,
+        70
       ]
     },
     {
-      "name": "TriggerOrderV3PlacedEvent",
+      "name": "TriggerOrderPlacedEvent",
       "discriminator": [
-        140,
-        38,
-        100,
+        199,
+        125,
+        44,
+        128,
+        6,
         249,
-        53,
-        74,
-        103,
-        217
-      ]
-    },
-    {
-      "name": "TriggerOrderV3SlippageCancelledEvent",
-      "discriminator": [
-        168,
-        176,
-        175,
-        126,
-        76,
-        219,
-        92,
-        4
-      ]
-    },
-    {
-      "name": "TwapOrderV3CancelledEvent",
-      "discriminator": [
-        110,
-        254,
         23,
-        159,
-        211,
-        230,
-        140,
+        17
+      ]
+    },
+    {
+      "name": "TriggerOrderSlippageCancelledEvent",
+      "discriminator": [
+        194,
+        66,
+        188,
+        29,
+        84,
+        111,
+        67,
+        143
+      ]
+    },
+    {
+      "name": "TwapOrderCancelledEvent",
+      "discriminator": [
+        34,
+        20,
+        3,
+        218,
+        212,
+        61,
+        148,
+        240
+      ]
+    },
+    {
+      "name": "TwapOrderPlacedEvent",
+      "discriminator": [
+        245,
+        35,
+        133,
+        15,
+        25,
+        19,
+        85,
+        201
+      ]
+    },
+    {
+      "name": "TwapSliceExecutedEvent",
+      "discriminator": [
+        184,
+        166,
+        2,
+        249,
+        98,
+        139,
+        176,
         147
       ]
     },
     {
-      "name": "TwapOrderV3PlacedEvent",
+      "name": "TwapSliceSlippageSkippedEvent",
       "discriminator": [
-        125,
-        64,
-        35,
-        185,
-        242,
-        240,
-        102,
-        146
-      ]
-    },
-    {
-      "name": "TwapSliceV3ExecutedEvent",
-      "discriminator": [
-        87,
-        81,
-        16,
-        174,
-        23,
-        88,
-        247,
-        225
-      ]
-    },
-    {
-      "name": "TwapSliceV3SlippageSkippedEvent",
-      "discriminator": [
-        73,
-        35,
-        145,
-        35,
-        244,
-        217,
-        212,
-        45
+        239,
+        215,
+        181,
+        76,
+        18,
+        149,
+        79,
+        177
       ]
     },
     {
@@ -20511,94 +20009,94 @@
       ]
     },
     {
-      "name": "VaultDepositV3Event",
+      "name": "VaultCreatedEvent",
       "discriminator": [
-        57,
-        56,
-        151,
-        161,
-        197,
-        35,
-        43,
-        173
-      ]
-    },
-    {
-      "name": "VaultOrderCancelledV3Event",
-      "discriminator": [
-        2,
-        1,
-        176,
-        226,
-        157,
-        17,
-        210,
-        141
-      ]
-    },
-    {
-      "name": "VaultOrderPlacedV3Event",
-      "discriminator": [
+        81,
+        80,
+        244,
+        58,
+        136,
+        54,
         236,
-        74,
-        181,
-        160,
-        227,
-        123,
-        231,
-        25
+        111
       ]
     },
     {
-      "name": "VaultPerfFeeSettledV3Event",
+      "name": "VaultDepositEvent",
       "discriminator": [
-        20,
-        232,
-        179,
-        37,
-        124,
-        248,
-        108,
-        108
-      ]
-    },
-    {
-      "name": "VaultTraderStateOpenedV3Event",
-      "discriminator": [
-        112,
-        184,
-        118,
-        170,
-        218,
-        69,
-        206,
-        196
-      ]
-    },
-    {
-      "name": "VaultV3CreatedEvent",
-      "discriminator": [
-        41,
-        206,
-        239,
-        88,
-        107,
-        247,
-        27,
-        78
-      ]
-    },
-    {
-      "name": "VaultWithdrawV3Event",
-      "discriminator": [
-        117,
-        176,
-        132,
-        112,
-        181,
-        53,
+        187,
+        186,
+        196,
+        189,
+        175,
         44,
-        79
+        10,
+        64
+      ]
+    },
+    {
+      "name": "VaultOrderCancelledEvent",
+      "discriminator": [
+        85,
+        135,
+        236,
+        235,
+        75,
+        139,
+        50,
+        53
+      ]
+    },
+    {
+      "name": "VaultOrderPlacedEvent",
+      "discriminator": [
+        43,
+        46,
+        243,
+        249,
+        229,
+        248,
+        5,
+        57
+      ]
+    },
+    {
+      "name": "VaultPerfFeeSettledEvent",
+      "discriminator": [
+        50,
+        102,
+        162,
+        253,
+        245,
+        94,
+        227,
+        169
+      ]
+    },
+    {
+      "name": "VaultTraderStateOpenedEvent",
+      "discriminator": [
+        56,
+        158,
+        83,
+        175,
+        232,
+        0,
+        158,
+        205
+      ]
+    },
+    {
+      "name": "VaultWithdrawEvent",
+      "discriminator": [
+        192,
+        143,
+        53,
+        201,
+        67,
+        20,
+        212,
+        195
       ]
     }
   ],
@@ -21171,7 +20669,7 @@
     {
       "code": 8321,
       "name": "LpSystemModeConflict",
-      "msg": "LP system conflict: the other LP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)"
+      "msg": "LP system conflict: the other LP accounting system already holds LP shares (singleton and per-market pools are mutually exclusive)"
     },
     {
       "code": 8322,
@@ -21359,7 +20857,7 @@
       }
     },
     {
-      "name": "BasketOrderNPlacedV2Event",
+      "name": "BasketOrderNPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -21381,7 +20879,7 @@
       }
     },
     {
-      "name": "BasketOrderPlacedV2Event",
+      "name": "BasketOrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -21594,7 +21092,7 @@
       }
     },
     {
-      "name": "BookDepthV2Event",
+      "name": "BookDepthEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -21705,7 +21203,7 @@
       }
     },
     {
-      "name": "BracketOrderV3PlacedEvent",
+      "name": "BracketOrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -21769,11 +21267,11 @@
       }
     },
     {
-      "name": "BulkOrderCancelledV2Event",
+      "name": "BulkOrderCancelledEvent",
       "docs": [
         "Emitted by `cancel_all`. `cancelled_count` is 0 when the trader had",
         "no resting orders (the ix is silently a no-op in that case — useful as",
-        "defensive cleanup from a bot). Bounded by `MAX_CANCELS_PER_IX_V2`."
+        "defensive cleanup from a bot). Bounded by `MAX_CANCELLATIONS_PER_INSTRUCTION`."
       ],
       "type": {
         "kind": "struct",
@@ -22700,38 +22198,6 @@
       }
     },
     {
-      "name": "FillCommitmentUpgradedV1Event",
-      "docs": [
-        "Emitted when a market's fill-commitment ring is",
-        "upgraded from the v0 layout to v1 (adds reduce-in-flight tracking)."
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "fill_commitment",
-            "type": "pubkey"
-          },
-          {
-            "name": "cap",
-            "type": "u32"
-          },
-          {
-            "name": "old_bytes",
-            "type": "u32"
-          },
-          {
-            "name": "new_bytes",
-            "type": "u32"
-          }
-        ]
-      }
-    },
-    {
       "name": "FillEntry",
       "docs": [
         "Per-fill payload inside a `FillBatchEvent`. The redundant `market`",
@@ -23110,6 +22576,30 @@
       }
     },
     {
+      "name": "IcebergCancelledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "iceberg_id",
+            "type": "u8"
+          },
+          {
+            "name": "unfilled_lots",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "IcebergOrderAccount",
       "docs": [
         "Iceberg order. Seeds: `[b\"iceberg\", market, trader, iceberg_id]`."
@@ -23191,7 +22681,7 @@
       }
     },
     {
-      "name": "IcebergOrderV3PlacedEvent",
+      "name": "IcebergOrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -23231,31 +22721,7 @@
       }
     },
     {
-      "name": "IcebergV3CancelledEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "iceberg_id",
-            "type": "u8"
-          },
-          {
-            "name": "unfilled_lots",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "IcebergV3ReplenishedEvent",
+      "name": "IcebergReplenishedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -23436,7 +22902,7 @@
           {
             "name": "invariant_code",
             "docs": [
-              "Solvency invariant identifier from docs/SAFETY.md (5 = OI balance,",
+              "Solvency invariant identifier from INVARIANTS.md (5 = OI balance,",
               "4 = vault conservation, etc)."
             ],
             "type": "u8"
@@ -23661,22 +23127,6 @@
       }
     },
     {
-      "name": "LegacyLpAccountsClosedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "authority",
-            "type": "pubkey"
-          },
-          {
-            "name": "reclaimed_lamports",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "LiqRestoreBufferSetEvent",
       "type": {
         "kind": "struct",
@@ -23701,7 +23151,7 @@
       }
     },
     {
-      "name": "LiquidationInjectedV2Event",
+      "name": "LiquidationInjectedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -24192,7 +23642,7 @@
       "name": "LpModeAccount",
       "docs": [
         "Protocol-wide LP-system lock. The singleton `LiquidityPoolAccount`",
-        "(`apply_lp_fill` books every LP fill into it) and the per-market v3 LP",
+        "(`apply_lp_fill` books every LP fill into it) and the per-market LP system",
         "redeem from the SAME vault, so LP shares outstanding in both would",
         "double-count the same realized PnL and let the last redeemers over-withdraw.",
         "This singleton records which system minted shares first; the other system's",
@@ -24210,7 +23660,7 @@
           {
             "name": "mode",
             "docs": [
-              "0 = unset, 1 = singleton, 2 = per-market v3."
+              "0 = unset, 1 = singleton, 2 = per-market."
             ],
             "type": "u8"
           },
@@ -24662,17 +24112,6 @@
             "type": "u64"
           },
           {
-            "name": "fill_commitment_required",
-            "docs": [
-              "Sticky flag: once `init_fill_commitment` arms this market, the",
-              "fill-commitment ring is MANDATORY in `apply_fill` — a (compromised)",
-              "sequencer cannot bypass the anti-fabrication guard by omitting the",
-              "optional ring account. Never cleared. Trailing field: accounts",
-              "serialized before it existed deserialize it as `false`."
-            ],
-            "type": "bool"
-          },
-          {
             "name": "haircut_enabled",
             "docs": [
               "Sticky flag: once `initialize_haircut_state` enables the haircut",
@@ -24740,7 +24179,7 @@
               "cross in one `place_taker_order` tx. Trailing field",
               "(`size_of::<MarketAccount>()` is 896 B with 256 B free under",
               "`space() = 1152`; pre-existing accounts deserialize it as `0`). `0`",
-              "means the global `MAX_BATCH_ORDERS_PER_SIDE_V2` (96) — the log-safe",
+              "means the global `MAX_MATCH_BATCH_ORDERS` (96) — the log-safe",
               "default. Raised (≤ `FILL_RING_CAP` = 256) ONLY by `init_fill_outbox`,",
               "which simultaneously arms the on-chain fill-outbox so the crossed",
               "fills are delivered OFF the program log: a cap above the ~96 log-safe",
@@ -24857,7 +24296,7 @@
               "`apply_lp_fill` auto-PAUSE the market (a flag write — the committed fill",
               "still settles; only NEW intake is blocked, which the intake gate already",
               "rejects on `Paused`). `0 = DISABLED` — the default, so this is opt-in per",
-              "market and legacy accounts (which read this trailing field as 0) are",
+              "market and default accounts (which read this trailing field as 0) are",
               "byte-for-byte unaffected. Set via `set_oi_insurance_multiple_bps`."
             ],
             "type": "u64"
@@ -24874,7 +24313,7 @@
               "the floor is what makes the breaker safely enable-able at launch. Because the",
               "cap is the MAX of the two terms, a floor only ever RAISES the ceiling — it can",
               "never trip the breaker more often than the floorless version. `0 = no floor`",
-              "(pure insurance-scaled), the legacy behaviour. Trailing field ⇒ pre-existing",
+              "(pure insurance-scaled), the default behaviour. Trailing field ⇒ pre-existing",
               "accounts (zero-padded to `space()`) read it as 0 — byte-for-byte unaffected.",
               "Bounded by `MAX_OI_INSURANCE_FLOOR_NOTIONAL`; set via",
               "`set_oi_insurance_floor_notional`."
@@ -24889,8 +24328,8 @@
               "(`scale_shock`), so a lower-vol asset is stress-tested to a smaller move",
               "and can carry higher leverage. The maintenance floor is tied to this via",
               "`hip3_core_bounds_ok` so a position is liquidatable exactly when a",
-              "worst-shock move would breach it. `0` ⇒ legacy ±30% (full lattice +",
-              "legacy 5% MM floor) — the safe default and off-switch. Trailing field ⇒",
+              "worst-shock move would breach it. `0` ⇒ default ±30% (full lattice +",
+              "default 5% MM floor) — the safe default and off-switch. Trailing field ⇒",
               "pre-existing accounts (zero-padded to `space()`) read it as 0. Set via",
               "`set_market_stress_tier`; a nonzero value must be ≥ `MIN_STRESS_SHOCK_BPS`."
             ],
@@ -24903,8 +24342,8 @@
               "underwrites, distinct from the (smaller) margin tier above. The backstop",
               "gate requires `insurance ≥ OI_cap × max(0, tail − MM) / BPS`, so leverage",
               "can never outrun what the fund can absorb on a tail gap PAST maintenance.",
-              "The setter enforces `tail ≥ max(LEGACY_STRESS_SHOCK_BPS, stress_shock)`,",
-              "so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ legacy 30% tail.",
+              "The setter enforces `tail ≥ max(BASELINE_STRESS_SHOCK_BPS, stress_shock)`,",
+              "so `tail > MM` always ⇒ the gate is never vacuous. `0` ⇒ default 30% tail.",
               "Trailing field ⇒ pre-existing accounts read it as 0."
             ],
             "type": "u32"
@@ -24930,7 +24369,7 @@
               "Phase 3 cross-asset offset credit — correlation group id. Positions in",
               "markets sharing a non-zero group id net their opposing worst-case losses",
               "by the group's correlation `corr_rho_bps`. `0` ⇒ market is in NO group ⇒",
-              "no offset (fully decorrelated, byte-identical to legacy). Trailing field",
+              "no offset (fully decorrelated, byte-identical to default). Trailing field",
               "within `space()` headroom; pre-existing accounts read it as 0."
             ],
             "type": "u16"
@@ -25489,30 +24928,6 @@
           },
           {
             "name": "initial_oracle_ticks",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "MarketMigratedToV3Event",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "old_size",
-            "type": "u32"
-          },
-          {
-            "name": "new_size",
-            "type": "u32"
-          },
-          {
-            "name": "slot",
             "type": "u64"
           }
         ]
@@ -26351,7 +25766,7 @@
         "`set_market_stress_tier` calibrated a market's per-asset stress tier and",
         "backstop tail. `worst_gap_loss` is the fund draw the tier is proven to be",
         "covered against (`OI_cap × max(0, tail − MM) / BPS`); `0` shocks/tail = the",
-        "legacy ±30% off-switch."
+        "default ±30% off-switch."
       ],
       "type": {
         "kind": "struct",
@@ -26572,7 +25987,7 @@
       }
     },
     {
-      "name": "OrderCancelledV2Event",
+      "name": "OrderCancelledEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -26604,7 +26019,7 @@
       }
     },
     {
-      "name": "OrderModifiedV2Event",
+      "name": "OrderModifiedEvent",
       "docs": [
         "Emitted by `modify_order` after the atomic cancel+place lands.",
         "`new_order_id` is the encoded id of the replacement order — off-chain",
@@ -26654,7 +26069,7 @@
       }
     },
     {
-      "name": "OrderPlacedV2Event",
+      "name": "OrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -27296,36 +26711,6 @@
       }
     },
     {
-      "name": "PositionMigratedEvent",
-      "docs": [
-        "Emitted by `migrate_position_to_trader_state_key`. Carries the",
-        "position's pre-migration core state for off-chain audit; indexers",
-        "re-key from the legacy `[POS_SEED, market, wallet]` PDA to the",
-        "new `[POS_SEED, market, trader_state]` PDA after this event lands."
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "trader",
-            "type": "pubkey"
-          },
-          {
-            "name": "market",
-            "type": "pubkey"
-          },
-          {
-            "name": "size_lots",
-            "type": "u64"
-          },
-          {
-            "name": "collateral_quote_lots",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "PredictedFundingEvent",
       "docs": [
         "View ix output: predicted next-batch funding rate. Emitted by",
@@ -27648,7 +27033,7 @@
             "name": "scope_market",
             "docs": [
               "Market scope. `Pubkey::default()` (all-zero) = the",
-              "session may act on ANY market (legacy/opt-out behaviour). A specific market",
+              "session may act on ANY market (default/opt-out behaviour). A specific market",
               "key = the session is restricted to that ONE market, so a leaked session key",
               "cannot dump the owner's collateral across every market. Enforced in `verify`."
             ],
@@ -28241,8 +27626,7 @@
       "name": "TriggerOrderAccount",
       "docs": [
         "Trigger order. Seeds: `[b\"trigger\", market, trader, trigger_id]`.",
-        "Distinct from the v1 `[b\"trigger\", ...]` prefix so both PDA families",
-        "can coexist without collision."
+        "Uses a dedicated PDA prefix to avoid collisions with other account families."
       ],
       "type": {
         "kind": "struct",
@@ -28325,7 +27709,7 @@
               "",
               "On refusal, the trigger DEACTIVATES (so it doesn't re-fire next",
               "slot at the same gapped price) and emits",
-              "`TriggerOrderV3SlippageCancelledEvent`. The trader can re-place",
+              "`TriggerOrderSlippageCancelledEvent`. The trader can re-place",
               "with updated params if they still want to act."
             ],
             "type": "u64"
@@ -28360,7 +27744,7 @@
       }
     },
     {
-      "name": "TriggerOrderV3CancelledEvent",
+      "name": "TriggerOrderCancelledEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28380,7 +27764,7 @@
       }
     },
     {
-      "name": "TriggerOrderV3ExecutedEvent",
+      "name": "TriggerOrderExecutedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28416,7 +27800,7 @@
       }
     },
     {
-      "name": "TriggerOrderV3PlacedEvent",
+      "name": "TriggerOrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28456,7 +27840,7 @@
       }
     },
     {
-      "name": "TriggerOrderV3SlippageCancelledEvent",
+      "name": "TriggerOrderSlippageCancelledEvent",
       "docs": [
         "Emitted when a trigger fires but the oracle has gapped",
         "past the trader's acceptable_price slippage cap. The trigger",
@@ -28589,7 +27973,7 @@
       }
     },
     {
-      "name": "TwapOrderV3CancelledEvent",
+      "name": "TwapOrderCancelledEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28613,7 +27997,7 @@
       }
     },
     {
-      "name": "TwapOrderV3PlacedEvent",
+      "name": "TwapOrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28653,7 +28037,7 @@
       }
     },
     {
-      "name": "TwapSliceV3ExecutedEvent",
+      "name": "TwapSliceExecutedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28693,7 +28077,7 @@
       }
     },
     {
-      "name": "TwapSliceV3SlippageSkippedEvent",
+      "name": "TwapSliceSlippageSkippedEvent",
       "docs": [
         "Emitted when a TWAP slice would fire but the slippage",
         "cap is breached. The slice is skipped; the TWAP stays active for",
@@ -28845,7 +28229,31 @@
       }
     },
     {
-      "name": "VaultDepositV3Event",
+      "name": "VaultCreatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "strategist",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_id",
+            "type": "u8"
+          },
+          {
+            "name": "perf_fee_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultDepositEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28873,7 +28281,7 @@
       }
     },
     {
-      "name": "VaultOrderCancelledV3Event",
+      "name": "VaultOrderCancelledEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28905,7 +28313,7 @@
       }
     },
     {
-      "name": "VaultOrderPlacedV3Event",
+      "name": "VaultOrderPlacedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -28941,7 +28349,7 @@
       }
     },
     {
-      "name": "VaultPerfFeeSettledV3Event",
+      "name": "VaultPerfFeeSettledEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -29000,7 +28408,7 @@
       }
     },
     {
-      "name": "VaultTraderStateOpenedV3Event",
+      "name": "VaultTraderStateOpenedEvent",
       "type": {
         "kind": "struct",
         "fields": [
@@ -29016,31 +28424,7 @@
       }
     },
     {
-      "name": "VaultV3CreatedEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "vault",
-            "type": "pubkey"
-          },
-          {
-            "name": "strategist",
-            "type": "pubkey"
-          },
-          {
-            "name": "vault_id",
-            "type": "u8"
-          },
-          {
-            "name": "perf_fee_bps",
-            "type": "u32"
-          }
-        ]
-      }
-    },
-    {
-      "name": "VaultWithdrawV3Event",
+      "name": "VaultWithdrawEvent",
       "type": {
         "kind": "struct",
         "fields": [

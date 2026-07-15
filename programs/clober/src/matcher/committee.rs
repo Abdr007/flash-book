@@ -122,9 +122,9 @@ mod proofs {
         let mask: u64 = kani::any();
         let slot: u8 = kani::any();
         kani::assume((slot as u32) < 64);
-        let m2 = jail_slot(mask, slot);
-        assert!(is_jailed(m2, slot));
-        assert_eq!(jail_slot(m2, slot), m2); // idempotent
+        let updated_mask = jail_slot(mask, slot);
+        assert!(is_jailed(updated_mask, slot));
+        assert_eq!(jail_slot(updated_mask, slot), updated_mask); // idempotent
     }
 
     /// Equivocation is exactly "same height, different digest" — and is symmetric
@@ -217,8 +217,8 @@ mod tests {
         let m = jail_slot(0, 3);
         assert!(is_jailed(m, 3) && !is_jailed(m, 2));
         assert_eq!(jail_slot(m, 3), m); // idempotent
-        let m2 = jail_slot(m, 0);
-        assert!(is_jailed(m2, 0) && is_jailed(m2, 3));
+        let updated_mask = jail_slot(m, 0);
+        assert!(is_jailed(updated_mask, 0) && is_jailed(updated_mask, 3));
 
         let da = [1u8; 32];
         let db = [2u8; 32];

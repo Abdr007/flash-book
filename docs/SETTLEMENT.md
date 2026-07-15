@@ -16,7 +16,7 @@ The fill lifecycle is split across two instructions:
 
 | Stage | Instruction | Where it runs |
 |-------|-------------|---------------|
-| Match: walk the hypertree, decrement/remove maker orders, produce fills | `place_taker_order_v2` | on-chain (L1, or the delegated ER) |
+| Match: walk the hypertree, decrement/remove maker orders, produce fills | `place_taker_order` | on-chain (L1, or the delegated ER) |
 | Settle: mutate collateral / position / PnL from the fill's economics | `apply_fill` / `apply_lp_fill` | base layer |
 
 Matching is trustless — the book is mutated on-chain and fills are a
@@ -26,7 +26,7 @@ as instruction arguments, so on its own it would trust the caller. The
 matcher's on-chain output:
 
 ```
- place_taker_order_v2 (matcher)                 apply_fill (settlement)
+ place_taker_order (matcher)                 apply_fill (settlement)
  ───────────────────────────────                ────────────────────────
  for each fill it produces:                     for each fill it settles:
    c = keccak(fill preimage)      ──ring──▶        c' = keccak(supplied args)
@@ -50,7 +50,7 @@ matcher's on-chain output:
 - **Ordering.** Settlement order must equal production order — the ring pops
   FIFO.
 - **Backpressure, not overwrite.** Once `produced − settled` reaches the
-  ring cap, `place_taker_order_v2` reverts (`FillRingFull`). A slow
+  ring cap, `place_taker_order` reverts (`FillRingFull`). A slow
   settlement keeper stalls new matching on that market (a liveness bound);
   it can never lose or corrupt a committed fill.
 
@@ -114,7 +114,7 @@ event data — one event overflows at ~125 fills and the tail is **silently
 truncated**. A truncated-but-crossed fill is unsettleable: the book is
 mutated and its commitment is in the ring, but the keeper never sees the
 data, so the ring slot never pops and settlement wedges. The log-mode cap
-(`MAX_BATCH_ORDERS_PER_SIDE_V2` = 96) keeps ~2.3 KB of headroom below that
+(`MAX_MATCH_BATCH_ORDERS` = 96) keeps ~2.3 KB of headroom below that
 cliff. Chunked emission makes this worse, not better — each chunk repeats
 the event header and consumes more of the same 10 KB budget.
 
@@ -165,7 +165,7 @@ settlement can never reject or resize a committed fill (§1), all of this is
 enforced at injection and match time. Three layers compose:
 
 1. **Injection-time cumulative capacity clamp (every market).** Before
-   `execute_trigger_order_v3` injects a reduce-only close order, it sums the
+   `execute_trigger_order` injects a reduce-only close order, it sums the
    position's existing resting reduce-only orders (same trader, sub-index,
    and close side) and clamps the new order so the **total resting
    reduce-only size can never exceed the position size**. Any set of
@@ -177,44 +177,37 @@ enforced at injection and match time. Three layers compose:
    close order whose position has since closed can never rest indefinitely
    and later fill.
 
-2. **Per-walk cap.** Within one `place_taker_order_v2` walk, a crossed
+2. **Per-walk cap.** Within one `place_taker_order` walk, a crossed
    reduce-only maker is capped to its reducible size, and multiple
    reduce-only orders on the same position share one decremented in-memory
    entry — a single taker call can never over-reduce.
 
-3. **In-flight tracking across the match→settle gap (v1 rings, opt-in per
-   market).** Between a fill's match and its settlement the `PositionAccount`
+3. **In-flight tracking across the match→settle gap.** Between a fill's match and its settlement the `PositionAccount`
    still shows the pre-reduction size, on L1 and on the ER clone. Without
    further state, two takers crossing the same position's reduce-only orders
    in separate calls inside that gap would each read the stale snapshot and
    collectively over-reduce — and the resulting flip would be a maker-side
-   open at settlement, where no intake margin gate can run. The v1
-   fill-commitment layout closes this by **co-locating a per-position
+   open at settlement, where no intake margin gate can run. The settlement
+   layout closes this by **co-locating a per-position
    reduce-in-flight tracker inside the fill-commitment account itself**:
    - The tracker commits **atomically with the ring** — no separate account,
      no cross-domain ER seam, and no change to the fill preimage
      (authenticity is untouched).
-   - On a v1 ring the matcher caps a reduce-only cross by
+   - The matcher caps a reduce-only cross by
      `position − in_flight[position]` and adds the fill to in-flight; a
      second taker reading a stale position snapshot sees reducible capacity
      already consumed and caps to zero.
    - `apply_fill` releases the in-flight amount when the fill settles. The
      maker and sub-index are preimage-committed, so the position key being
      released is authentic.
-   - The layout is version-gated with per-version length validation: v0
-     rings are byte-identical to their original layout, and a market opts in
-     via `upgrade_fill_commitment_v1` (authority-gated, ring drained).
 
 **Invariant:** across all in-flight reduce-only fills of a position, total
 reduction never exceeds the position size — a reduce-only order cannot flip
 a position, within a walk, across walks, or across the match→settle gap.
 Pinned by host tests (the capacity-clamp book scan), an end-to-end
 BanksClient test (two stops, deferred settlement, second cross caps to
-zero), and the v1 ring round-trip tests.
-
-Operational note: full closure on a **live** market requires the one-time
-`upgrade_fill_commitment_v1` call per market (see the operations runbook);
-a v0 market has layers 1–2 (the primary vector) but not layer 3.
+zero), and settlement-ring round-trip tests. Every freshly deployed market
+uses this complete layout.
 
 ### Accepted residual — reduce-only intent vs. an orthogonal position change
 
@@ -223,7 +216,7 @@ it*. One residual is inherent to asynchronous settlement and is accepted,
 not fixed: if a reduce-only maker fill is committed to the ring, and then —
 in the window after the ring is undelegated to L1 but before `apply_fill`
 drains that fill — the maker's position is independently taken to flat by
-`liquidate_position_v2` / `liquidate_portfolio_v2` / `auto_deleverage`,
+`liquidate_position` / `liquidate_portfolio` / `auto_deleverage`,
 the committed fill settles against a now-flat position and opens the
 opposite side. The reduce-only *intent* is violated.
 
@@ -310,7 +303,7 @@ SBF_OUT_DIR=$PWD/target/deploy cargo test -p clober --test integration \
     deep_book_matching_cu_curve -- --nocapture
 ```
 
-### `place_limit_order_v2` — CU vs insertion depth
+### `place_limit_order` — CU vs insertion depth
 
 | depth | CU | | depth | CU |
 |------:|-----:|-|------:|-----:|
@@ -322,7 +315,7 @@ SBF_OUT_DIR=$PWD/target/deploy cargo test -p clober --test integration \
 13.0k–14.1k CU, flat across 511 price levels — O(log n) hypertree insertion
 holds at depth, not just on an empty book.
 
-### `place_taker_order_v2` — CU vs levels crossed (armed)
+### `place_taker_order` — CU vs levels crossed (armed)
 
 | levels crossed | CU | CU/level |
 |---------------:|------:|---------:|

@@ -5,22 +5,22 @@
 > to preserve solvency, and the oracle-manipulation attack class that cost a
 > competitor $20M+ is proven impossible by construction. Devnet, unaudited.
 
-Program ID: 5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq (Solana). Anchor program.
+Program ID: 8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z (Solana). Anchor program.
 Amounts are integers: quote_lots, ticks (price = ticks × tick_size), base_lots.
 side 0=long 1=short. sub_index selects a sub-account (0=primary).
 
 ## Start here
 
 - [Agent trading guide](AGENTS.md): the trading lifecycle, instruction signatures, state model, and a minimal client bootstrap.
-- [Gotchas](docs/GOTCHAS.md): the non-obvious footguns — sequencer trust model, armed markets, PDA seeds, funding crank, withdraw-anytime reserve margin, sub-indices.
-- [Anchor IDL](idl/clober.json): the machine source of truth — 149 instructions, 28 accounts, 138 events, 114 typed errors.
+- [Production invariants](INVARIANTS.md): the release contract for settlement, custody, risk, oracle, and authority safety.
+- [Anchor IDL](idl/clober.json): the machine source of truth — 162 instructions, 31 accounts, 146 events, 120 typed errors.
 
 ## Core instructions
 
 - open_trader_state(): create the per-wallet collateral/positions PDA.
 - deposit_collateral(amount_quote_lots): fund the account (SPL transfer in).
-- place_limit_order_v2(side, size_lots, limit_ticks, flags, expires_at_slot, sub_index): rest an order on the hypertree book (the sole limit path).
-- place_taker_order_v2(...): cross the book; emits FillBatchEvent.
+- place_limit_order(side, size_lots, limit_ticks, flags, expires_at_slot, sub_index): rest an order on the hypertree book (the sole limit path).
+- place_taker_order(...): cross the book; emits FillBatchEvent.
 - crank_funding(): permissionless; advance cum_funding_index (rate-capped, oracle-gated, Δt clamped).
 - settle_funding(): realize a position's funding into collateral via the proven route_funding path.
 - partial_withdraw_collateral(amount_quote_lots): withdraw anytime, gated by withdrawable = collateral − max(IM, floor) − er_reserved.
@@ -35,5 +35,5 @@ side 0=long 1=short. sub_index selects a sub-account (0=primary).
 
 ## Optional
 
-- [Launch framing / honesty](docs/LAUNCH_FRAMING.md): devnet + pre-audit posture; what is and isn't proven.
+- [Deployment runbook](docs/DEPLOYMENT.md): required key management, initialization, and live verification gates.
 - [Sequencer tooling](sequencer/README.md): production decoders and cranks (attestation cranker, raw hypertree walk).

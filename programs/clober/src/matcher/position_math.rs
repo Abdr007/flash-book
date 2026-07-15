@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_v2_notional_return_formula() {
+    fn matches_notional_return_formula() {
         // long 10 lots @ entry 100, close @ 120, tick 1.
         // clober: 10 · (120−100) · 1 = 200.
         let fb = apply_fill(
@@ -417,11 +417,11 @@ mod tests {
         )
         .unwrap()
         .realized_pnl_quote_lots;
-        // V2: (mark−entry)/entry · size_usd, size_usd = notional = 10·100·1 = 1000.
+        // native: (mark−entry)/entry · size_usd, size_usd = notional = 10·100·1 = 1000.
         //     (120−100)/100 · 1000 = 0.2 · 1000 = 200.
         let notional = 10.0 * 100.0 * 1.0;
-        let v2 = ((120.0 - 100.0) / 100.0) * notional;
-        assert_eq!(fb, v2 as i64);
+        let return_formula = ((120.0 - 100.0) / 100.0) * notional;
+        assert_eq!(fb, return_formula as i64);
         assert_eq!(fb, 200);
     }
 
@@ -431,7 +431,7 @@ mod tests {
     /// and the notional-return reconciliation `fb·entry == (mark−entry)·notional`. Both
     /// sides, profit and loss (fp ≷ e0), and several tick sizes. 1,700+ cases.
     #[test]
-    fn reduce_flip_pnl_and_v2_reconciliation_exhaustive_small() {
+    fn reduce_flip_pnl_reconciliation_exhaustive_small() {
         for side in 0u8..=1 {
             let sign: i128 = if side == SIDE_LONG { 1 } else { -1 };
             let opp = 1 - side;
@@ -487,8 +487,8 @@ mod tests {
                                 o.realized_pnl_quote_lots as i128,
                                 sign * (s0 as i128) * ((fp as i128) - (e0 as i128)) * (ts as i128)
                             );
-                            // V2 RECONCILIATION (division-free): clober's
-                            // exact-integer PnL equals V2's return-formula value.
+                            // native RECONCILIATION (division-free): clober's
+                            // exact-integer PnL equals native's return-formula value.
                             let fb: i128 =
                                 (s0 as i128) * ((fp as i128) - (e0 as i128)) * (ts as i128);
                             let notional: i128 = (s0 as i128) * (e0 as i128) * (ts as i128);

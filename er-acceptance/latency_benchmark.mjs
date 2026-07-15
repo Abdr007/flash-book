@@ -1,7 +1,7 @@
 // ── Track B — MagicBlock ER fill-latency benchmark (devnet, reproduced) ──────────
 //
 // Measures the CLIENT-OBSERVED round-trip of a REAL taker fill on the MagicBlock ER:
-// build placeTakerOrderV2 → sendRawTransaction to the ER validator → confirm. Reuses
+// build placeTakerOrder → sendRawTransaction to the ER validator → confirm. Reuses
 // the proven er_acceptance genesis (init market + book/ring/outbox, delegate to the
 // ER, fund maker+taker, ER margin attestations), then loops rest-bid → timed-taker.
 //
@@ -134,10 +134,10 @@ try {
   const total = SAMPLES + WARMUP;
   for (let i = 0; i < total; i++) {
     const tick = 90000 - (i % 80) * 10;
-    await send(er, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
+    await send(er, await program.methods.placeLimitOrder(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
     // Time ONLY the successful send attempt (429 backoff happens between attempts,
     // outside the measured window), so the distribution reflects clean round-trips.
-    const takerIx = await program.methods.placeTakerOrderV2(1, new BN(1), new BN(1), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction();
+    const takerIx = await program.methods.placeTakerOrder(1, new BN(1), new BN(1), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction();
     let sig, ms;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -164,14 +164,14 @@ try {
     if (i % 5 === 0 || !warm) console.log(`  #${i}${warm ? "" : " (warmup)"}  ${ms.toFixed(1)} ms  cu=${cu ?? "?"}  ${sig.slice(0, 12)}…`);
     await sleep(400); // pacing to stay under the public ER endpoint rate limit
   }
-  const m2 = rows.filter((r) => r.warm).map((r) => r.ms);
+  const warm_samples = rows.filter((r) => r.warm).map((r) => r.ms);
   const cus = rows.filter((r) => r.warm && r.cu != null).map((r) => r.cu);
-  const mean = m2.reduce((a, x) => a + x, 0) / m2.length;
+  const mean = warm_samples.reduce((a, x) => a + x, 0) / warm_samples.length;
   const report = {
     endpoint: ER_RPC, validator: ER_VALIDATOR.toBase58(), market: M.toBase58(),
-    method: "client performance.now() around placeTakerOrderV2 send->confirm('confirmed') on the ER; INCLUDES client<->ER network RTT (upper bound on ER execution)",
-    samples: m2.length, warmup: WARMUP,
-    latency_ms: { p50: +pct(m2, 50).toFixed(2), p90: +pct(m2, 90).toFixed(2), p95: +pct(m2, 95).toFixed(2), p99: +pct(m2, 99).toFixed(2), min: +Math.min(...m2).toFixed(2), max: +Math.max(...m2).toFixed(2), mean: +mean.toFixed(2) },
+    method: "client performance.now() around placeTakerOrder send->confirm('confirmed') on the ER; INCLUDES client<->ER network RTT (upper bound on ER execution)",
+    samples: warm_samples.length, warmup: WARMUP,
+    latency_ms: { p50: +pct(warm_samples, 50).toFixed(2), p90: +pct(warm_samples, 90).toFixed(2), p95: +pct(warm_samples, 95).toFixed(2), p99: +pct(warm_samples, 99).toFixed(2), min: +Math.min(...warm_samples).toFixed(2), max: +Math.max(...warm_samples).toFixed(2), mean: +mean.toFixed(2) },
     compute_units: cus.length ? { min: Math.min(...cus), max: Math.max(...cus), median: pct(cus, 50) } : null,
     raw: rows,
   };

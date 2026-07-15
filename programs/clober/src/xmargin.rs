@@ -224,7 +224,7 @@ pub fn reserve_add(reserved: u64, add: u64) -> Result<u64> {
 /// `reserved − sub`, SATURATING at 0. Saturation (not checked) is REQUIRED for
 /// safety: an order that was placed BEFORE this feature shipped carries no
 /// reservation, so its release would otherwise underflow — saturating makes the
-/// release a safe no-op for such legacy orders and can never lock a trader out
+/// release a safe no-op for such default orders and can never lock a trader out
 /// by driving `reserved` negative. It can only ever equal or over-release toward
 /// 0, never under-release, so the invariant `reserved ≥ Σ live-order IM` is
 /// preserved (over-release only frees the trader's own collateral). Every
@@ -316,7 +316,7 @@ pub fn required_collateral_with_er(im_required: u64, notional_floor: u64, er_res
 /// OI-vs-insurance circuit-breaker predicate. TRUE iff the market's GROSS
 /// open-interest notional exceeds the effective cap
 /// `max(insurance_balance · multiple_bps / BPS_DENOM, floor_notional)`.
-/// `multiple_bps == 0` DISABLES the breaker (returns false), so legacy markets
+/// `multiple_bps == 0` DISABLES the breaker (returns false), so default markets
 /// that never opted in are unaffected.
 ///
 /// BOOTSTRAP FLOOR (`floor_notional`): the pure insurance-scaled cap collapses to
@@ -331,7 +331,7 @@ pub fn required_collateral_with_er(im_required: u64, notional_floor: u64, er_res
 /// trips more often than the floorless breaker (`oi_breaker_floor_only_loosens`),
 /// and a market whose gross OI is within its floor can never be bricked
 /// (`oi_breaker_floor_never_bricks_bootstrap`). `floor_notional == 0` = no floor
-/// (pure insurance-scaled), the legacy behaviour.
+/// (pure insurance-scaled), the default behaviour.
 ///
 /// All arithmetic is 128-bit SATURATING: it can never overflow or panic, and an
 /// overflowed notional saturates to the max and trips the breaker — fail-safe
@@ -393,7 +393,7 @@ pub fn notional_exceeds_effective_cap(
 ///
 /// `tail_bps` is the per-market black-swan tail the fund underwrites — DISTINCT
 /// from (and ≥) the margin `stress_shock_bps`; the setter enforces `tail ≥
-/// max(LEGACY_STRESS_SHOCK_BPS, stress_shock)` so `tail > mm` for any leverage-
+/// max(BASELINE_STRESS_SHOCK_BPS, stress_shock)` so `tail > mm` for any leverage-
 /// unlocking tier ⇒ the gate is never vacuous (`backstop_gate_is_non_vacuous`).
 /// All arithmetic is 128-bit SATURATING — an overflowed loss trips (fail-safe,
 /// never panics). The `/ BPS_DENOM` divide is pinned by the host grid-test
@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(r, 30_000);
         assert_eq!(reserve_release(r, 5_000), 25_000);
         assert_eq!(reserve_release(25_000, 25_000), 0); // place→cancel nets to 0
-                                                        // Legacy (unreserved) order release saturates, never underflows.
+                                                        // Default (unreserved) order release saturates, never underflows.
         assert_eq!(reserve_release(0, 25_000), 0);
         // Reserve overflow errors rather than wrapping.
         assert!(reserve_add(u64::MAX, 1).is_err());
@@ -850,7 +850,7 @@ mod xmargin_kani_proofs {
     }
 
     /// RELEASE NEVER UNDERFLOWS: releasing any amount saturates at 0 — a
-    /// legacy order (placed before reservations existed, so unreserved) whose
+    /// default order (placed before reservations existed, so unreserved) whose
     /// release exceeds `reserved` is a safe no-op, never a panic or wrap. Release
     /// only ever moves `reserved` toward 0 (frees the trader's own collateral),
     /// so the invariant `reserved >= Σ live-order IM` is preserved.
@@ -863,7 +863,7 @@ mod xmargin_kani_proofs {
     }
 
     /// the breaker is DISABLED when `multiple_bps == 0` — it never trips, so
-    /// a legacy market that never opted in is byte-for-byte unaffected. Over the
+    /// a default market that never opted in is byte-for-byte unaffected. Over the
     /// whole input domain (no assumptions), including ANY floor value — a floor
     /// alone never activates a disabled breaker.
     #[kani::proof]

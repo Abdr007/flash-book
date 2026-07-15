@@ -55,7 +55,7 @@ use state::{
     LiquidityPoolAccount, MarketAccount, MarketParams, TraderStateAccount,
 };
 
-declare_id!("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
+declare_id!("8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z");
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_security_txt::security_txt! {
@@ -106,7 +106,7 @@ pub mod clober {
     /// Front-run-safe: the market PDA is keyed by `(base_mint, quote_mint)`, and
     /// because the params are envelope-clamped, whoever wins the create race
     /// produces an equally-safe market. Like the authority path it is fail-closed
-    /// (`fill_commitment_required = true`) until the creator arms it with a ring.
+    /// until the creator initializes its commitment ring.
     pub fn create_permissionless_market(
         ctx: Context<CreatePermissionlessMarket>,
         params: MarketParams,
@@ -136,9 +136,9 @@ pub mod clober {
         )
     }
 
-    /// Initialize the v2 hypertree-backed orderbook for a market.
+    /// Initialize the hypertree-backed orderbook for a market.
     /// Allocates a fresh PDA at `[b"market_book", market]` of exactly
-    /// MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the v2 discriminator,
+    /// MARKET_BOOK_TOTAL_BYTES (8264 B), stamps the native discriminator,
     /// and writes an empty header with all RBT root indices = NIL.
     ///
     /// This is the foundation for the wave-18 orderbook rewrite. The
@@ -177,7 +177,7 @@ pub mod clober {
             &[signer_seeds],
         )?;
 
-        // Write the v2 discriminator + zero-init the header.
+        // Write the native discriminator + zero-init the header.
         let mut data = ctx.accounts.market_book.try_borrow_mut_data()?;
         book_state::MarketBookHandle::write_disc_and_init_header(
             &mut data, bump, market_key, base_mint, quote_mint,
@@ -202,7 +202,7 @@ pub mod clober {
     pub fn init_fill_commitment(ctx: Context<InitFillCommitment>, cap: u32) -> Result<()> {
         use matcher::fill_commitment as fc;
         // Per-market ring cap — the versatile knob. Bounds:
-        //   * `>= MAX_BATCH_ORDERS_PER_SIDE_V2` (96): a log-mode market with no
+        //   * `>= MAX_MATCH_BATCH_ORDERS` (96): a log-mode market with no
         //     outbox can walk up to the global default, which a smaller ring would
         //     overflow (`FillRingFull`).
         //   * `<= FILL_RING_CAP` (256): the account-size + Kani-proof bound.
@@ -211,15 +211,15 @@ pub mod clober {
         // ER. Up to 256 is the L1 deep-sweep (the outbox can't be ER-delegated past
         // ~105 — the 10,240 B/ix buffer-create cap; see docs/SETTLEMENT.md §2).
         require!(
-            cap >= MAX_BATCH_ORDERS_PER_SIDE_V2 as u32 && cap <= fc::FILL_RING_CAP,
+            cap >= MAX_MATCH_BATCH_ORDERS as u32 && cap <= fc::FILL_RING_CAP,
             CloberError::OutOfRange
         );
         let market_key = ctx.accounts.market.key();
         let bump = ctx.bumps.fill_commitment;
 
-        // Arm at the v1 layout so the reduce-in-flight tracker is live from the
-        // first fill; a v0 ring cannot see a filled-but-unsettled reduce-only
-        // order across the match→settle gap.
+        // The complete settlement layout includes reduce-in-flight tracking from
+        // the first fill, so a filled-but-unsettled reduce-only order cannot be
+        // over-reduced across the match-to-settle gap.
         let space = fc::fill_commit_account_len(cap as usize);
         let rent = Rent::get()?;
         let lamports = rent.minimum_balance(space);
@@ -245,9 +245,6 @@ pub mod clober {
         fc::buffer_init(&mut data, &market_key.to_bytes(), cap, bump)
             .map_err(|_| error!(CloberError::FillRingCorrupt))?;
         drop(data);
-
-        // ARM the market — settlement now REQUIRES the ring (sticky).
-        ctx.accounts.market.fill_commitment_required = true;
 
         emit!(FillCommitmentInitializedEvent {
             market: market_key,
@@ -281,7 +278,7 @@ pub mod clober {
 
         let market_bytes = ctx.accounts.market.key().to_bytes();
         // Validate + read the current cap, and require the ring be DRAINED.
-        let (old_cap, version) = {
+        let old_cap = {
             let data = fc_ai.try_borrow_data()?;
             let cap = fc::buffer_check(&data, &market_bytes)
                 .map_err(|_| error!(CloberError::FillRingCorrupt))?;
@@ -289,7 +286,7 @@ pub mod clober {
                 fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
                 CloberError::FillRingNotDrained
             );
-            (cap, fc::buffer_version(&data))
+            cap
         };
 
         let new_cap = old_cap
@@ -298,15 +295,10 @@ pub mod clober {
         // NOTE: grow intentionally raises the ring past `FILL_RING_CAP` (the init
         // default) — it is the per-ER-session fill ceiling; no upper bound here.
         let old_len = fc_ai.data_len();
-        // Version-aware target length: a v1 ring carries the per-slot reduce
-        // flags + in-flight map after the ring, so it grows by more than the ring
-        // bytes alone. Guard the ACTUAL data increase against the per-ix realloc
-        // cap.
-        let new_len = if version >= 1 {
-            fc::fill_commit_account_len(new_cap as usize)
-        } else {
-            fc::fill_commit_ring_len(new_cap as usize)
-        };
+        // The complete layout carries per-slot reduce flags and an in-flight map
+        // after the ring. Guard the actual data increase against the per-ix
+        // realloc cap.
+        let new_len = fc::fill_commit_account_len(new_cap as usize);
         require!(
             new_len.saturating_sub(old_len)
                 <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
@@ -338,17 +330,12 @@ pub mod clober {
         fc_ai.resize(new_len)?;
         {
             let mut data = fc_ai.try_borrow_mut_data()?;
-            if version >= 1 {
-                // The ring is drained (checked above), so its slots, per-slot
-                // reduce flags, and in-flight map are all logically empty. Growing
-                // the ring shifts the flags+map to a higher offset; re-zero the
-                // whole post-header region so the enlarged ring slots and the
-                // relocated flags/map are clean at the new cap. The header
-                // (absolute produced/settled cursors, cap, market, version) is
-                // left intact.
-                for b in &mut data[fc::FILL_COMMIT_HEADER_LEN..] {
-                    *b = 0;
-                }
+            // The ring is drained (checked above), so its slots, per-slot reduce
+            // flags, and in-flight map are all logically empty. Growing the ring
+            // shifts the flags and map to higher offsets; re-zero the post-header
+            // region so the enlarged layout is clean. The header is left intact.
+            for b in &mut data[fc::FILL_COMMIT_HEADER_LEN..] {
+                *b = 0;
             }
             fc::buffer_set_cap(&mut data, new_cap);
             fc::buffer_check(&data, &market_bytes)
@@ -360,85 +347,6 @@ pub mod clober {
             fill_commitment: fc_ai.key(),
             old_cap,
             new_cap,
-            old_bytes: old_len as u32,
-            new_bytes: new_len as u32,
-        });
-        Ok(())
-    }
-
-    /// One-way, authority-gated upgrade of a market's
-    /// fill-commitment ring from the v0 layout to v1, enabling per-position
-    /// reduce-in-flight tracking, closing the last reduce-only edge: a position
-    /// shrunk below its resting reduce-only size, then over-crossed across the
-    /// match→settle gap.
-    /// MUST run on the BASE LAYER with the ring UNdelegated (a delegated ring is
-    /// owned by the delegation program — realloc would be illegal) and the ring
-    /// DRAINED (`produced == settled`; a pending fill would be left without a reduce
-    /// flag — `buffer_upgrade_to` enforces this). Re-running on a v1 ring reverts.
-    pub fn upgrade_fill_commitment(ctx: Context<UpgradeFillCommitment>) -> Result<()> {
-        use matcher::fill_commitment as fc;
-        let fc_ai = ctx.accounts.fill_commitment.to_account_info();
-        require_keys_eq!(*fc_ai.owner, *ctx.program_id, CloberError::Unauthorized);
-        let market_bytes = ctx.accounts.market.key().to_bytes();
-
-        // Validate as a v0 account and require a drained ring.
-        let cap = {
-            let data = fc_ai.try_borrow_data()?;
-            let cap = fc::buffer_check(&data, &market_bytes)
-                .map_err(|_| error!(CloberError::FillRingCorrupt))?;
-            require!(fc::buffer_version(&data) == 0, CloberError::OutOfRange);
-            require!(
-                fc::buffer_next_index(&data) == fc::buffer_settle_index(&data),
-                CloberError::FillRingNotDrained
-            );
-            cap
-        };
-
-        let old_len = fc_ai.data_len();
-        let new_len = fc::fill_commit_account_len(cap as usize);
-        require!(new_len > old_len, CloberError::OutOfRange);
-        let additional_bytes = new_len - old_len;
-        require!(
-            additional_bytes
-                <= anchor_lang::solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE,
-            CloberError::OutOfRange
-        );
-
-        // Top up rent so the larger account stays rent-exempt.
-        let rent = Rent::get()?;
-        let new_minimum = rent.minimum_balance(new_len);
-        let cur_lamports = fc_ai.lamports();
-        if new_minimum > cur_lamports {
-            let topup = new_minimum.saturating_sub(cur_lamports);
-            anchor_lang::solana_program::program::invoke(
-                &anchor_lang::solana_program::system_instruction::transfer(
-                    &ctx.accounts.authority.key(),
-                    &fc_ai.key(),
-                    topup,
-                ),
-                &[
-                    ctx.accounts.authority.to_account_info(),
-                    fc_ai.clone(),
-                    ctx.accounts.system_program.to_account_info(),
-                ],
-            )?;
-        }
-
-        // Grow in place (zero-inits the appended regions), migrate to v1, and
-        // re-validate so a botched realloc/migrate fails loudly.
-        fc_ai.resize(new_len)?;
-        {
-            let mut data = fc_ai.try_borrow_mut_data()?;
-            fc::buffer_upgrade_to(&mut data, &market_bytes)
-                .map_err(|_| error!(CloberError::FillRingCorrupt))?;
-            fc::buffer_check(&data, &market_bytes)
-                .map_err(|_| error!(CloberError::FillRingCorrupt))?;
-        }
-
-        emit!(FillCommitmentUpgradedV1Event {
-            market: ctx.accounts.market.key(),
-            fill_commitment: fc_ai.key(),
-            cap,
             old_bytes: old_len as u32,
             new_bytes: new_len as u32,
         });
@@ -495,7 +403,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Grow an existing v2 `market_book` PDA in place by `additional_nodes`
+    /// Grow an existing native `market_book` PDA in place by `additional_nodes`
     /// hypertree slots — this is what breaks the 100-node init cap. Only the
     /// market authority may call it (same gate as `init_market_book`).
     ///
@@ -623,7 +531,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Delegate the v2 hypertree market_book PDA to the MagicBlock ER.
+    /// Delegate the hypertree market_book PDA to the MagicBlock ER.
     /// After this lands, the account state lives on the ER for sub-ms
     /// matcher access; only this program (via PDA signature) can
     /// undelegate it back to mainnet. The market account must also be
@@ -1341,12 +1249,7 @@ pub mod clober {
     pub fn init_fill_outbox(ctx: Context<InitFillOutbox>) -> Result<()> {
         use matcher::fill_commitment as fc;
         use matcher::fill_outbox as fo;
-        // The outbox extends an armed market — the ring must already exist (its
-        // account is created by `init_fill_commitment`, which sets this flag).
-        require!(
-            ctx.accounts.market.fill_commitment_required,
-            CloberError::FillCommitmentMissing
-        );
+        // The outbox extends a market with an initialized commitment ring.
         let market_key = ctx.accounts.market.key();
         // The RING is the single source of truth for the cap — read it and size the
         // outbox + the market batch cap to MATCH, so `fo_cap >= ring_cap` holds by
@@ -1588,7 +1491,7 @@ pub mod clober {
     }
 
     /// Limit-order placement against the hypertree-backed orderbook — the sole
-    /// limit-placement path (the legacy order-buffer book was removed; every
+    /// limit-placement path (the default order-buffer book was removed; every
     /// market is initialized with `init_market_book`).
     ///
     /// Intake: status-active gate, min-base-lots, tick alignment, size cap. Then
@@ -1607,7 +1510,7 @@ pub mod clober {
         sub_index: u8,
     ) -> Result<()> {
         // Cold-wallet path: the trader signs directly (unchanged behaviour).
-        place_limit_v2_core(
+        place_limit_core(
             &ctx.accounts.market,
             &ctx.accounts.market_book,
             ctx.accounts.trader.key(),
@@ -1627,10 +1530,10 @@ pub mod clober {
     /// SESSION-KEY path (additive): an ephemeral `session_signer` places an order
     /// for `session_token.owner` (verified + unexpired), so a client trading on
     /// the ER need not sign every order with the cold wallet. IDENTICAL matching
-    /// logic to `place_limit_order` — both call the same `place_limit_v2_core`,
+    /// logic to `place_limit_order` — both call the same `place_limit_core`,
     /// differing only in how the trader identity is authenticated.
-    pub fn place_limit_order_v2_session(
-        ctx: Context<PlaceLimitOrderV2Session>,
+    pub fn place_limit_order_session(
+        ctx: Context<PlaceLimitOrderSession>,
         side: u8,
         size_lots: u64,
         limit_ticks: u64,
@@ -1645,7 +1548,7 @@ pub mod clober {
             now,
             ctx.accounts.market.key(),
         )?;
-        place_limit_v2_core(
+        place_limit_core(
             &ctx.accounts.market,
             &ctx.accounts.market_book,
             ctx.accounts.session_token.owner,
@@ -1665,7 +1568,7 @@ pub mod clober {
     /// 4.3: place a LADDER of `num_levels` resting limit orders in one instruction —
     /// `size_per_level` at each of `base_limit_ticks`, `base ± price_step_ticks`, … moving
     /// AWAY from the mid (bids step DOWN, asks step UP). Each rung is a full
-    /// `place_limit_v2_core`, so every per-order gate (tick / 5-sig-fig / min-notional /
+    /// `place_limit_core`, so every per-order gate (tick / 5-sig-fig / min-notional /
     /// anti-stuffing band / OI cap / intake margin) applies to each rung independently and a
     /// rung that fails (e.g. steps out of band) aborts the whole ladder. Opening liquidity
     /// tool: `reduce_only` is not allowed here (each rung would need its own reducible-size
@@ -1714,7 +1617,7 @@ pub mod clober {
                     .checked_add(offset)
                     .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?
             };
-            place_limit_v2_core(
+            place_limit_core(
                 &ctx.accounts.market,
                 &ctx.accounts.market_book,
                 ctx.accounts.trader.key(),
@@ -1808,7 +1711,7 @@ pub mod clober {
     ) -> Result<()> {
         // Hot-path validation: collapsed branches, single Clock::get().
         let market = &ctx.accounts.market;
-        // ER readiness while the book is delegated (see place_limit_v2_core):
+        // ER readiness while the book is delegated (see place_limit_core):
         // the trader's reserved-margin attestation account must exist so the
         // sequencer can attest the margin this order reserves. L1 orders are
         // unaffected.
@@ -1923,7 +1826,7 @@ pub mod clober {
         // fill-commitment ring, and apply_fill hard-loads that TraderState to settle.
         // Reject an intake whose TraderState does not exist / is not the caller's —
         // otherwise an uninitialized taker leg permanently wedges the strict FIFO
-        // (mirrors the maker-side gate in place_limit_v2_core).
+        // (mirrors the maker-side gate in place_limit_core).
         {
             let ts = ctx.accounts.trader_state.load()?;
             verify_trader_state_pda(
@@ -2023,23 +1926,21 @@ pub mod clober {
                 }
             }
         }
-        // If the fill-commitment ring uses the v1 layout, subtract each maker
+        // If the fill-commitment ring uses the native, subtract each maker
         // position's PENDING (matched-but-unsettled) reduce-only lots from its
         // reducible. This makes over-reduction impossible ACROSS the match→settle gap
         // (two takers each reading a stale position snapshot), not just within one
         // call — closing the residual where a position shrinks below its resting
-        // reduce-only. On a v0 ring this loop is a no-op (reducible == position size).
+        // reduce-only.
         {
             let mkt = market_key.to_bytes();
             if let Some(fc_acct) = find_fill_commitment(ctx.remaining_accounts, program_id, &mkt) {
                 if let Ok(fc_data) = fc_acct.try_borrow_data() {
                     use matcher::fill_commitment as fc;
-                    if fc::buffer_version(&fc_data) == 1 {
-                        if let Ok(cap) = fc::buffer_check(&fc_data, &mkt) {
-                            for entry in maker_positions.iter_mut() {
-                                let pending = fc::inflight_get(&fc_data, cap, &entry.0.to_bytes());
-                                entry.2 = entry.2.saturating_sub(pending);
-                            }
+                    if let Ok(cap) = fc::buffer_check(&fc_data, &mkt) {
+                        for entry in maker_positions.iter_mut() {
+                            let pending = fc::inflight_get(&fc_data, cap, &entry.0.to_bytes());
+                            entry.2 = entry.2.saturating_sub(pending);
                         }
                     }
                 }
@@ -2064,7 +1965,7 @@ pub mod clober {
 
         // Advanced order flags:
         //   bit 0  POST_ONLY    — reject if any matches (caller wants rest)
-        //   bit 1  REDUCE_ONLY  — UNSUPPORTED on v2: rejected at intake,
+        //   bit 1  REDUCE_ONLY  — UNSUPPORTED on native: rejected at intake,
         //                         never enforced here (no settlement-time check)
         //   bit 2  IOC          — cancel residual after walk (no rest)
         //   bit 3  JIT          — just-in-time maker bonus
@@ -2091,7 +1992,7 @@ pub mod clober {
         let mut remaining = size_lots;
         // Pre-size to the typical walk depth (most takers fill in <16
         // levels). Skips ~3 doubling reallocs on the hot path; the
-        // worst-case walk is bounded by MAX_BATCH_ORDERS_PER_SIDE_V2
+        // worst-case walk is bounded by MAX_MATCH_BATCH_ORDERS
         // and any overflow spills onto the heap via Vec's grow path.
         // Stack-allocated fixed arrays aren't viable here: at 256-cap
         // × 60 B per tuple the array exceeds BPF's 4 KB stack frame.
@@ -2112,7 +2013,7 @@ pub mod clober {
         // fill_price_ticks, maker_pubkey, maker_sub_index) — maker_sub_index
         // is included so the emitted FillEntry carries it for the sequencer.
         // Tuple: (maker node idx, maker order id, fill lots, fill price, maker
-        // trader, maker sub_index, is_reduce_only). The trailing flag (v1 rings) lets
+        // trader, maker sub_index, is_reduce_only). The trailing flag (current rings) lets
         // the ring-push loop track this fill's reduce-in-flight against the maker's
         // position so a later taker (before settlement) cannot over-reduce it.
         let mut matches: Vec<(hypertree::DataIndex, u64, u64, u64, Pubkey, u8, bool)> =
@@ -2360,20 +2261,16 @@ pub mod clober {
             let fc_opt =
                 find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
             let fo_opt = find_fill_outbox(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
-            // Armed market ⇒ the ring is MANDATORY (else a taker consumes
-            // maker liquidity, pushes NO commitment, and leaves fills unsettleable —
-            // wedging settlement, griefing makers at zero cost). Mirrors `apply_fill`.
-            require!(
-                !market.fill_commitment_required || fc_opt.is_some(),
-                CloberError::FillCommitmentMissing
-            );
+            // Every market requires the commitment ring. Without it a taker could
+            // consume maker liquidity while leaving fills unverifiable.
+            require!(fc_opt.is_some(), CloberError::FillCommitmentMissing);
             // A cap above the log-safe 96 means the fills CANNOT fit the 10 KB
             // program log, so the outbox account MUST be present to carry them — else
             // the tail truncates in the log and wedges settlement.
             // `init_fill_outbox` is the only path that raises the cap and it arms the
             // outbox, so an honest sequencer always passes it; this fails closed.
             require!(
-                fo_opt.is_some() || walk_limit <= MAX_BATCH_ORDERS_PER_SIDE_V2,
+                fo_opt.is_some() || walk_limit <= MAX_MATCH_BATCH_ORDERS,
                 CloberError::FillOutboxRequired
             );
             // The outbox slots are addressed by the ring's `produced` cursor, so an
@@ -2420,18 +2317,10 @@ pub mod clober {
                     require!(fo_cap >= ring_cap, CloberError::FillRingCorrupt);
                 }
                 produced_from = fc::buffer_next_index(&fc_data);
-                // On a v1 ring, track each reduce-only fill's lots
-                // against the maker's position in-flight so a later taker (before this
-                // fill settles) sees a reduced reducible (subtracted in the pre-scan
-                // above). `None` on a v0 ring ⇒ tracking is inert (unchanged behavior).
-                let ring_v1_cap: Option<u32> = if fc::buffer_version(&fc_data) == 1 {
-                    Some(
-                        fc::buffer_check(&fc_data, &fc_market_bytes)
-                            .map_err(|_| error!(CloberError::FillRingCorrupt))?,
-                    )
-                } else {
-                    None
-                };
+                // Track each reduce-only fill against the maker position so a later
+                // taker, before settlement, sees the already-reserved reducible size.
+                let ring_cap = fc::buffer_check(&fc_data, &fc_market_bytes)
+                    .map_err(|_| error!(CloberError::FillRingCorrupt))?;
                 for (
                     _maker_idx,
                     maker_id,
@@ -2468,18 +2357,16 @@ pub mod clober {
                     // releases it when it settles this index. A full in-flight map fails
                     // CLOSED (FillRingFull) — a liveness bound, never an over-reduce.
                     if *is_reduce_only {
-                        if let Some(cap) = ring_v1_cap {
-                            let pos_key = derive_maker_position_key(
-                                &market_key,
-                                maker_trader,
-                                *maker_sub_idx,
-                                program_id,
-                            )
-                            .to_bytes();
-                            fc::inflight_add(&mut fc_data, cap, &pos_key, *fill_size)
-                                .map_err(|_| error!(CloberError::FillRingFull))?;
-                            fc::reduce_flag_set(&mut fc_data, cap, idx);
-                        }
+                        let pos_key = derive_maker_position_key(
+                            &market_key,
+                            maker_trader,
+                            *maker_sub_idx,
+                            program_id,
+                        )
+                        .to_bytes();
+                        fc::inflight_add(&mut fc_data, ring_cap, &pos_key, *fill_size)
+                            .map_err(|_| error!(CloberError::FillRingFull))?;
+                        fc::reduce_flag_set(&mut fc_data, ring_cap, idx);
                     }
                     // Mirror the fill DATA into outbox[idx % cap] (heap-free direct
                     // write). The ring's backpressure (`Full` above) guarantees this
@@ -2529,7 +2416,7 @@ pub mod clober {
                     produced_to,
                 });
             } else {
-                // Legacy fat event — only reached at cap ≤ 96 (log-safe). Build the
+                // Default fat event — only reached at cap ≤ 96 (log-safe). Build the
                 // FillEntry Vec here (kept tiny by the cap) and emit.
                 let mut fills: Vec<FillEntry> = Vec::with_capacity(matches.len());
                 for (_i, maker_id, fill_size, fill_price, maker_trader, maker_sub_idx, _ro) in
@@ -2628,22 +2515,22 @@ pub mod clober {
 
     // ─── REMOVED: wrapper-program CPI ixs (place_limit_order_v2_cpi,
     // cpi_release_collateral_to_user, cpi_open_trader_state_for_trader,
-    // cpi_credit_collateral, cpi_debit_collateral, cancel_order_v2_cpi)
+    // cpi_credit_collateral, cpi_debit_collateral, cancel_order_cpi)
     // were the cross-program CPI gate used by the now-merged wrapper
     // programs. With monolithic clober the wrapper-authority gate is
     // gone — ixs operate directly.
 
-    /// V2 cancel: remove a resting order from the hypertree. Validates
+    /// native cancel: remove a resting order from the hypertree. Validates
     /// that the caller is the original trader (orders carry the trader
-    /// pubkey inline). Refunds no SPL tokens — the v2 book holds no escrow;
+    /// pubkey inline). Refunds no SPL tokens — the native book holds no escrow;
     /// collateral never leaves the trader's account on placement.
     ///
     /// The off-chain SDK derives `order_id` via
     /// `encode_order_id(price_ticks, seq, side == 0)` from the
-    /// `OrderPlacedV2Event` fields.
+    /// `OrderPlacedEvent` fields.
     pub fn cancel_order(ctx: Context<CancelOrder>, side: u8, order_id: u64) -> Result<()> {
         // Cold-wallet path: the trader signs directly (unchanged behaviour).
-        cancel_v2_core(
+        cancel_order_core(
             &ctx.accounts.market_book,
             ctx.accounts.market.key(),
             ctx.accounts.trader.key(),
@@ -2654,9 +2541,9 @@ pub mod clober {
 
     /// SESSION-KEY cancel (additive): an ephemeral `session_signer` cancels an
     /// order owned by `session_token.owner` (verified + unexpired). Same core
-    /// logic via `cancel_v2_core`; only the identity source differs.
-    pub fn cancel_order_v2_session(
-        ctx: Context<CancelOrderV2Session>,
+    /// logic via `cancel_order_core`; only the identity source differs.
+    pub fn cancel_order_session(
+        ctx: Context<CancelOrderSession>,
         side: u8,
         order_id: u64,
     ) -> Result<()> {
@@ -2667,7 +2554,7 @@ pub mod clober {
             now,
             ctx.accounts.market.key(),
         )?;
-        cancel_v2_core(
+        cancel_order_core(
             &ctx.accounts.market_book,
             ctx.accounts.market.key(),
             ctx.accounts.session_token.owner,
@@ -2734,11 +2621,11 @@ pub mod clober {
         Ok(())
     }
 
-    /// V2 cancel-all: remove every resting order owned by the caller in
+    /// native cancel-all: remove every resting order owned by the caller in
     /// this market. Walks both bid and ask RBTs, collecting indices of
     /// orders whose `trader == caller`, then removes each in two
     /// passes (read-only walk → mutating removes). The walk is bounded
-    /// by `MAX_CANCELS_PER_IX_V2 = 24`: a single tx that triggers more
+    /// by `MAX_CANCELLATIONS_PER_INSTRUCTION = 24`: a single tx that triggers more
     /// cancels would risk the BPF CU budget. Traders with many resting
     /// orders simply call this ix repeatedly until `cancelled_count == 0`.
     ///
@@ -2758,7 +2645,7 @@ pub mod clober {
         // immutably; removal needs &mut handle. Collect first, mutate after.
         let mut bid_idxs: Vec<hypertree::DataIndex> = Vec::with_capacity(8);
         let mut ask_idxs: Vec<hypertree::DataIndex> = Vec::with_capacity(8);
-        let cap = MAX_CANCELS_PER_IX_V2;
+        let cap = MAX_CANCELLATIONS_PER_INSTRUCTION;
 
         // NEVER bulk-cancel a liquidation-close
         // order (`order_type == 3`). It is injected by `liquidate_position` on
@@ -2793,7 +2680,7 @@ pub mod clober {
             handle.remove_ask_node(*idx);
         }
 
-        emit!(BulkOrderCancelledV2Event {
+        emit!(BulkOrderCancelledEvent {
             market: market_key,
             trader: trader_pk,
             cancelled_count,
@@ -2804,13 +2691,13 @@ pub mod clober {
 
     /// keeper/authority retirement of a stranded
     /// liquidation-close order. The OWNER cannot cancel an `order_type == 3` order
-    /// (`cancel_v2_core` / `cancel_all` — that closes the liquidation-dodge), so a
+    /// (`cancel_order_core` / `cancel_all` — that closes the liquidation-dodge), so a
     /// legitimate path must exist to clear one that never filled (e.g. the position
     /// recovered or was closed by other means, leaving the synthetic close resting).
     /// Gated to the market `sequencer` (the settlement keeper that drives liquidation)
     /// or the market `authority` — NEVER the owner. ONLY `order_type == 3` is retirable
     /// here: this is not a general keeper-cancel bypass. Reuses the same book-removal
-    /// plumbing as `cancel_v2_core`.
+    /// plumbing as `cancel_order_core`.
     pub fn retire_liquidation_order(
         ctx: Context<RetireLiquidationOrder>,
         side: u8,
@@ -2855,7 +2742,7 @@ pub mod clober {
             handle.remove_ask_node(idx);
         }
 
-        emit!(OrderCancelledV2Event {
+        emit!(OrderCancelledEvent {
             market: market_key,
             trader: order_trader,
             order_seq,
@@ -2866,7 +2753,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// V2 modify: atomic cancel + place in one ix. Cheaper than two
+    /// native modify: atomic cancel + place in one ix. Cheaper than two
     /// separate txs (one signature, one set of account-load costs)
     /// and preserves the trader's intent across the cancel window —
     /// no chance of being filled between the cancel and the replacement.
@@ -2876,7 +2763,7 @@ pub mod clober {
     /// BEFORE removing the old order so a malformed modify doesn't
     /// silently drop the original. The new order receives a fresh
     /// `seq` from the header's monotonic counter; off-chain consumers
-    /// must re-derive the order_id from the emitted `OrderModifiedV2Event`.
+    /// must re-derive the order_id from the emitted `OrderModifiedEvent`.
     pub fn modify_order(
         ctx: Context<PlaceLimitOrder>,
         side: u8,
@@ -2890,7 +2777,7 @@ pub mod clober {
         let now_slot = Clock::get()?.slot;
 
         // Fast input guards — same as place_limit_order.
-        // 4.6: reduce_only (bit1) is HONORED on modify, exactly like place_limit_v2_core:
+        // 4.6: reduce_only (bit1) is HONORED on modify, exactly like place_limit_core:
         // the re-inserted resting order carries the flag and the symmetric, inflight-aware
         // maker clamp in the taker walk caps it to the position's reducible size AT FILL, so
         // a modified reduce-only order can never open or flip. (modify is Active/PostOnly-only,
@@ -3023,7 +2910,7 @@ pub mod clober {
             handle.insert_ask(order)?
         };
 
-        emit!(OrderModifiedV2Event {
+        emit!(OrderModifiedEvent {
             market: market_key,
             trader: trader_pk,
             side,
@@ -3037,10 +2924,10 @@ pub mod clober {
         Ok(())
     }
 
-    /// V2 read-side: emit the top-N levels of the hypertree-backed book
+    /// native read-side: emit the top-N levels of the hypertree-backed book
     /// as an event. Walks `for_each_bid_best_first` / `for_each_ask_best_first`
     /// and packs the first BOOK_DEPTH_LEVELS=4 of each side into a single
-    /// `BookDepthV2Event`. Pure read — never mutates state.
+    /// `BookDepthEvent`. Pure read — never mutates state.
     ///
     /// This is the wave-18e validation that the RBT iteration is correct:
     /// after a series of `place_limit_order` calls, the bids-best-first
@@ -3081,7 +2968,7 @@ pub mod clober {
             asks.len() < BOOK_DEPTH_LEVELS
         });
 
-        emit!(BookDepthV2Event {
+        emit!(BookDepthEvent {
             market: market_key,
             total_orders_active: handle.header.total_orders_active,
             bids,
@@ -3133,49 +3020,6 @@ pub mod clober {
         Ok(())
     }
 
-    /// One-time migration for deployments that predate the pool-singleton
-    /// seed rename (`flp_exposure` → `lp_exposure`): the singleton moved to
-    /// a new PDA but the treasury `LpPositionAccount` seed did not, so a
-    /// pre-rename treasury survives at the exact address
-    /// `initialize_liquidity_pool` must `init` — permanently wedging pool
-    /// (re)initialization. Closes the stranded treasury position and drains
-    /// the orphaned pre-rename singleton, refunding rent to the authority.
-    ///
-    /// Only legal while the canonical `lp_exposure` singleton does NOT
-    /// exist (`AlreadyInitialized` otherwise): once the pool is live, the
-    /// same seeds address the LIVE treasury endowment, which must never be
-    /// closeable.
-    pub fn close_legacy_lp_accounts(ctx: Context<CloseLegacyLpAccounts>) -> Result<()> {
-        let pool = &ctx.accounts.lp_exposure;
-        require!(
-            pool.owner == &anchor_lang::system_program::ID && pool.data_is_empty(),
-            CloberError::AlreadyInitialized
-        );
-
-        // The orphaned pre-rename singleton is program-owned at the retired
-        // PDA. Drain its lamports to the authority and zero the data so the
-        // runtime reaps it and stale bytes can never be re-read.
-        let legacy = &ctx.accounts.legacy_flp_exposure;
-        require!(legacy.owner == &crate::ID, CloberError::Unauthorized);
-        let reclaimed = legacy.lamports();
-        **legacy.try_borrow_mut_lamports()? = 0;
-        let authority_ai = ctx.accounts.authority.to_account_info();
-        let topped = authority_ai
-            .lamports()
-            .checked_add(reclaimed)
-            .ok_or(error!(CloberError::ArithmeticOverflow))?;
-        **authority_ai.try_borrow_mut_lamports()? = topped;
-        legacy.try_borrow_mut_data()?.fill(0);
-
-        // `legacy_treasury_position` is closed (rent → authority) by its
-        // `close = authority` constraint.
-        emit!(LegacyLpAccountsClosedEvent {
-            authority: ctx.accounts.authority.key(),
-            reclaimed_lamports: reclaimed,
-        });
-        Ok(())
-    }
-
     /// Deposit capital into the LP pool and mint shares at the current
     /// NAV/share price. Permissionless — any signer can become an LP.
     /// Their LpPositionAccount is created lazily via init_if_needed.
@@ -3188,10 +3032,10 @@ pub mod clober {
     ) -> Result<()> {
         require!(amount_quote_lots > 0, CloberError::ZeroSize);
 
-        // LP-system lock: the singleton and per-market v3 pools redeem from the
+        // LP-system lock: the singleton and per-market pools redeem from the
         // same vault, so LP shares outstanding in both would double-count the
         // same realized PnL. Claim the singleton mode on the first mint; reject
-        // if v3 has already claimed it. Checked before any funds move.
+        // if native has already claimed it. Checked before any funds move.
         {
             let m = &mut ctx.accounts.lp_mode;
             if m.mode == state::LpModeAccount::MODE_UNSET {
@@ -3275,7 +3119,7 @@ pub mod clober {
         // Only bootstrap 1:1 when there are genuinely NO shares yet. If shares
         // exist but the mark-to-market NAV has fallen <= 0 (pool insolvent after
         // trading losses), minting against it would dilute the depositor into
-        // near-worthless legacy shares. Reject.
+        // near-worthless default shares. Reject.
         require!(
             !(shares_outstanding > 0 && pricing_nav <= 0),
             CloberError::LpPoolInsolvent
@@ -3360,7 +3204,7 @@ pub mod clober {
         );
         // Enforce the LP minimum hold so an LP cannot flash-deposit just
         // before a fee / realized-PnL event that lifts NAV and redeem the
-        // windfall without bearing risk. deposited_at_slot==0 (legacy accounts)
+        // windfall without bearing risk. deposited_at_slot==0 (default accounts)
         // ⇒ can_withdraw true (no lock retroactively imposed).
         require!(
             matcher::jit_lp_defense::can_withdraw(
@@ -3999,12 +3843,17 @@ pub mod clober {
     // The sub-account's `delegate` field works independently from the
     // main account's — different hot keys can drive different sub-
     // accounts. `referrer` and `builder` are also per-sub-account.
+    /// Create a trader-owned isolated sub-account at `sub_index` (1 through
+    /// 255). Index 0 is reserved for `open_trader_state`. Each sub-account has
+    /// independent collateral, positions, delegate, and canonical PDA, so a
+    /// strategy cannot substitute another sub-account during trading or
+    /// settlement.
     pub fn open_trader_sub_account(
         ctx: Context<OpenTraderSubAccount>,
         sub_index: u8,
     ) -> Result<()> {
         // sub_index 0 is reserved for the main account (which uses the
-        // legacy PDA seeds and `open_trader_state`).
+        // default PDA seeds and `open_trader_state`).
         require!(sub_index >= 1, CloberError::OutOfRange);
         let trader_key = ctx.accounts.trader.key();
         let bump = ctx.bumps.trader_sub_account;
@@ -4144,71 +3993,6 @@ pub mod clober {
         Ok(())
     }
 
-    /// Migrate a Position from the legacy PDA `[POS_SEED, market, wallet]`
-    /// to the canonical PDA `[POS_SEED, market, trader_state.key()]`. The
-    /// trader-state-keyed derivation makes sub-account positions distinct
-    /// from main, which is the prerequisite for sub-account trading.
-    ///
-    /// Per (wallet, market). Only legacy wallet-keyed positions need
-    /// migration — sub-account positions only ever exist at the canonical
-    /// derivation. The legacy PDA is closed and rent refunded to the trader. The new PDA is
-    /// init'd with the same on-chain state (size, side, entry, funding
-    /// indices, realized PnL, isolated collateral, timing fields).
-    ///
-    /// Idempotent in the sense that calling it a second time fails
-    /// because the legacy PDA no longer exists at the old address;
-    /// callers can safely re-run after partial failure.
-    pub fn migrate_position_to_trader_state_key(
-        ctx: Context<MigratePositionToTraderStateKey>,
-    ) -> Result<()> {
-        let new_bump = ctx.bumps.new_position;
-        let market_key = ctx.accounts.market.key();
-
-        // Snapshot the legacy position's state, then drop the read guard
-        // before initializing the new (zero-copy) position account.
-        let legacy = *ctx.accounts.legacy_position.load()?;
-
-        require!(
-            legacy.trader == ctx.accounts.trader.key(),
-            CloberError::WrongTrader
-        );
-        require!(legacy.market == market_key, CloberError::WrongMarket);
-        // Note: legacy.collateral_quote_lots can be > 0 if
-        // the position was isolated — that value is preserved.
-
-        {
-            let mut new_pos = ctx.accounts.new_position.load_init()?;
-            new_pos.market = legacy.market;
-            new_pos.trader = legacy.trader;
-            new_pos.side = legacy.side;
-            new_pos.size_lots = legacy.size_lots;
-            new_pos.entry_price_ticks = legacy.entry_price_ticks;
-            new_pos.cum_funding_index_at_entry = legacy.cum_funding_index_at_entry;
-            new_pos.realized_pnl_quote_lots = legacy.realized_pnl_quote_lots;
-            new_pos.funding_paid_quote_lots = legacy.funding_paid_quote_lots;
-            new_pos.last_settlement_batch = legacy.last_settlement_batch;
-            new_pos.unhealthy_since_slot = legacy.unhealthy_since_slot;
-            new_pos.last_liquidated_at_slot = legacy.last_liquidated_at_slot;
-            new_pos.collateral_quote_lots = legacy.collateral_quote_lots;
-            // Preserve the trader's self-imposed per-position leverage cap.
-            // Omitting it would leave the zero-copy-initialized field at 0, the
-            // sentinel for "use the market max", silently removing the trader's
-            // tighter guardrail across the migration.
-            new_pos.leverage_cap = legacy.leverage_cap;
-            new_pos.bump = new_bump;
-        }
-
-        emit!(PositionMigratedEvent {
-            trader: legacy.trader,
-            market: market_key,
-            size_lots: legacy.size_lots,
-            collateral_quote_lots: legacy.collateral_quote_lots,
-        });
-        // Anchor closes `legacy_position` via the `close = trader`
-        // constraint on the Accounts struct, refunding rent.
-        Ok(())
-    }
-
     /// Set the trader's referrer. ONE-TIME-WRITE: once set to a non-default
     /// pubkey, the field cannot be rewritten. Anti-rotation griefing —
     /// referrers earn off the trader for the lifetime of the account, no
@@ -4325,7 +4109,7 @@ pub mod clober {
     /// pairs in remaining_accounts (count must equal source.open_positions).
     /// Post-sweep margin is evaluated against the joint stress-lattice;
     /// rejects if the source would become unhealthy after the withdrawal.
-    /// Source flat → pass `[]` for remaining_accounts (the legacy fast path).
+    /// Source flat → pass `[]` for remaining_accounts (the default fast path).
     ///
     /// Cannot sweep to/from the same account.
     pub fn sweep_collateral<'info>(
@@ -4725,7 +4509,7 @@ pub mod clober {
     ///     anti-deposit-then-withdraw guard prevents a trader from
     ///     temporarily topping up to satisfy IM, placing a trade, then
     ///     immediately yanking the temporary collateral leaving only
-    ///     enough for maintenance margin (a known footgun in v1
+    ///     enough for maintenance margin (a known footgun in current
     ///     systems that gate only on IM)
     ///
     /// remaining_accounts layout: alternating (market, position) pairs
@@ -5604,7 +5388,7 @@ pub mod clober {
         // prior stamped rate (state = `last_funding_rate_bps_per_sec`) over
         // `funding_premium_twap_window` periods, so a MOMENTARY band-edge premium at a rapid
         // crank cannot stamp a full-period tick — only a sustained premium converges. window
-        // == 0 ⇒ no smoothing (legacy). The smoothed rate is still capped to `rate_max`.
+        // == 0 ⇒ no smoothing (default). The smoothed rate is still capped to `rate_max`.
         let (delta, smoothed_rate) = matcher::funding::funding_index_delta_smoothed(
             funding_mark,
             market.oracle_price_ticks,
@@ -5674,7 +5458,7 @@ pub mod clober {
     /// JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads
     /// this from the order's stored flags. When true, the maker earns
     /// `market.params.jit_bonus_rebate_bps` extra rebate on top of the
-    /// base maker_rebate_bps. Passing false preserves legacy behaviour.
+    /// base maker_rebate_bps. Passing false preserves default behaviour.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_fill(
         ctx: Context<ApplyFill>,
@@ -5691,17 +5475,7 @@ pub mod clober {
         require!(taker_side <= 1, CloberError::OutOfRange);
 
         // ── Settlement authorization ────────────────────────────
-        // `apply_fill` takes fill data at face value, so the signer MUST
-        // be the market's authorized sequencer. Without this gate ANY
-        // signer could fabricate fills against arbitrary positions and
-        // drain the quote vault. Decoupled from `market.authority` so it
-        // survives the authority-burn ladder (see `state.rs` MarketAccount
-        // .sequencer). A market whose sequencer is still the zero pubkey
-        // (pre-field markets) fails closed here — settlement halts until
-        // `set_market_sequencer` is called.
-        // PERMISSIONLESS keeper for ARMED markets. On an armed
-        // market (`fill_commitment_required`, the §3.2 default) the commitment ring
-        // below FULLY constrains settlement — `apply_fill` recomputes
+        // The commitment ring fully constrains settlement: `apply_fill` recomputes
         // `keccak(fill_preimage)`, which binds the market, BOTH trader identities
         // (from the passed trader-state accounts), side, size, price, sub-indices
         // and the JIT flag, and pops it FIFO (`buffer_settle`). So a caller can only
@@ -5710,15 +5484,8 @@ pub mod clober {
         // haircut accounts are MANDATORY when armed/enabled — see below). Therefore
         // ANY signer may drive settlement on an armed market: the industry-standard
         // permissionless-keeper model (censorship-resistant, ZERO extra CU vs. a
-        // single sequencer). An UNARMED (legacy) market has no ring enforcement, so
-        // it stays gated on the single `market.sequencer` (failing closed if that is
-        // still the zero key). The `sequencer` account is just the fee-paying signer
-        // here — for an armed market it need not equal `market.sequencer`.
-        require!(
-            ctx.accounts.market.fill_commitment_required
-                || ctx.accounts.sequencer.key() == ctx.accounts.market.sequencer,
-            CloberError::Unauthorized
-        );
+        // single sequencer). The `sequencer` account is the fee-paying signer;
+        // it need not equal `market.sequencer`.
 
         // ── Monotonic replay guard ───────────────────────────────
         // `fill_seq` must STRICTLY exceed the market's settlement nonce. A
@@ -5735,26 +5502,15 @@ pub mod clober {
         // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
         // any replay/reorder is rejected (FillSeqReplay) before state mutates.
         //
-        // An ARMED market is permissionless
-        // (any keeper settles) and the ring below is mandatory + provides
-        // replay-protection (verify-and-pop, FIFO), so a caller-controlled
-        // `fill_seq` is redundant AND a market-freeze DoS (settling one authentic
-        // fill with `fill_seq = u64::MAX` wedges every later settlement). On the
-        // armed path auto-increment by 1 (deterministic, un-grief-able); the
-        // legacy unarmed SEQUENCER path (trusted) keeps the supplied `fill_seq`.
-        ctx.accounts.market.last_settlement_seq = if ctx.accounts.market.fill_commitment_required {
-            ctx.accounts
-                .market
-                .last_settlement_seq
-                .checked_add(1)
-                .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?
-        } else {
-            matcher::fill_commitment::advance_settlement_seq(
-                ctx.accounts.market.last_settlement_seq,
-                fill_seq,
-            )
-            .map_err(|_| error!(CloberError::FillSeqReplay))?
-        };
+        // The ring provides replay protection and ordering, so a caller-supplied
+        // nonce cannot influence settlement progression.
+        let _ = fill_seq;
+        ctx.accounts.market.last_settlement_seq = ctx
+            .accounts
+            .market
+            .last_settlement_seq
+            .checked_add(1)
+            .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
 
         // Legibility / defense-in-depth: taker and maker MUST be
         // distinct position accounts. A self-fill (same account passed twice) would
@@ -5808,14 +5564,8 @@ pub mod clober {
         // replay guard above.
         let fc_market_bytes = ctx.accounts.market.key().to_bytes();
         let fc_opt = find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &fc_market_bytes);
-        // Once a market is ARMED (`init_fill_commitment`
-        // sets `fill_commitment_required`), the ring is MANDATORY. The sequencer
-        // builds this tx; without this hard-require a compromised sequencer could
-        // simply omit the optional account and settle FABRICATED fills unguarded.
-        require!(
-            !ctx.accounts.market.fill_commitment_required || fc_opt.is_some(),
-            CloberError::FillCommitmentMissing
-        );
+        // The ring is mandatory. Without it a caller could settle fabricated fills.
+        require!(fc_opt.is_some(), CloberError::FillCommitmentMissing);
         // If the market has the haircut engine ENABLED, the
         // (optional) haircut accounts are MANDATORY — otherwise a settlement that
         // omits them routes positive realized PnL straight to collateral with NO
@@ -5877,20 +5627,18 @@ pub mod clober {
             // the same lots, so the tracker returns to zero exactly as the ring drains.
             // `maker`/`maker_sub_index` are committed in the preimage above (the settle
             // would have failed FillNotCommitted otherwise), so the derived position
-            // key is authentic and matches the matcher's reservation. No-op on v0.
-            if fc::buffer_version(&fc_data) == 1 {
-                if let Ok(cap) = fc::buffer_check(&fc_data, &market_bytes) {
-                    if fc::reduce_flag_take(&mut fc_data, cap, idx) {
-                        let market_pk = ctx.accounts.market.key();
-                        let pos_key = derive_maker_position_key(
-                            &market_pk,
-                            &maker_pk,
-                            maker_sub_index,
-                            ctx.program_id,
-                        )
-                        .to_bytes();
-                        fc::inflight_sub(&mut fc_data, cap, &pos_key, size_lots);
-                    }
+            // key is authentic and matches the matcher's reservation.
+            if let Ok(cap) = fc::buffer_check(&fc_data, &market_bytes) {
+                if fc::reduce_flag_take(&mut fc_data, cap, idx) {
+                    let market_pk = ctx.accounts.market.key();
+                    let pos_key = derive_maker_position_key(
+                        &market_pk,
+                        &maker_pk,
+                        maker_sub_index,
+                        ctx.program_id,
+                    )
+                    .to_bytes();
+                    fc::inflight_sub(&mut fc_data, cap, &pos_key, size_lots);
                 }
             }
         }
@@ -6712,7 +6460,7 @@ pub mod clober {
         // reject — the fill itself already settled; we just dampen the
         // effect on mark.
         //
-        // alpha == 0 keeps the legacy behaviour (mark never updates from
+        // alpha == 0 keeps the default behaviour (mark never updates from
         // fills). Production should set 2_000 (20% weight per fill).
         let alpha_bps =
             (market.params.mark_ema_alpha_bps as u128).min(constants::BPS_DENOM as u128);
@@ -6943,7 +6691,7 @@ pub mod clober {
         // effective cap `max(insurance · multiple / BPS, floor)`, auto-PAUSE the
         // market — a plain flag write, NOT a revert (the committed fill must stand;
         // intake already rejects Paused, so only NEW risk is blocked). Opt-in:
-        // `oi_insurance_multiple_bps == 0` (default / legacy) makes
+        // `oi_insurance_multiple_bps == 0` (default / default) makes
         // `oi_exceeds_insurance_cap` return false. The `oi_insurance_floor_notional`
         // is the absolute OI notional always tolerated so enabling the breaker on a
         // near-zero-insurance market can't brick it.
@@ -7326,7 +7074,7 @@ pub mod clober {
         // used deliberately: the permissionless `settle_mark` bumps the mark
         // slot, so a down ER could otherwise be kept "alive" — evading this
         // pause — by anyone spamming settle_mark while the L1 oracle stays fresh.
-        // Guard on `> 0` so a legacy market that has never stamped either field
+        // Guard on `> 0` so a default market that has never stamped either field
         // is not paused on missing data (liquidation already prices such markets
         // oracle-only).
         let liveness_slot = market.last_settlement_slot.max(market.last_heartbeat_slot);
@@ -7376,12 +7124,6 @@ pub mod clober {
         Ok(())
     }
 
-    /// Update market status (authority-only).
-    ///
-    /// Status transitions:
-    ///   Active → PostOnly: existing positions trade; new takers blocked
-    ///   Active → Paused:   no order intake; existing positions held
-    ///   Any → Closed:      terminal sunset; only liquidation + close
     /// Clear the `book_delegated` flag once the market's book is back on L1
     /// (undelegated). Authority-gated. Until called, the flag stays `true` and
     /// order placement keeps requiring the armed lock — fail closed, never a
@@ -7406,6 +7148,10 @@ pub mod clober {
         Ok(())
     }
 
+    /// Set market operating status. The market authority may select any valid
+    /// transition except reopening a terminally closed market. A configured
+    /// guardian may only tighten a live market to PostOnly, Paused, or Closed;
+    /// it can never loosen risk controls or reopen trading.
     pub fn set_market_status(ctx: Context<SetMarketStatus>, new_status: u8) -> Result<()> {
         require!(new_status <= 5, CloberError::OutOfRange);
         let caller = ctx.accounts.authority.key();
@@ -7531,7 +7277,7 @@ pub mod clober {
     /// Calibrate a market's per-asset stress tier (Phase 1). Sets the margin
     /// `stress_shock_bps` (scales the margin lattice ⇒ tiered leverage) and the
     /// `backstop_tail_bps` (the black-swan gap the insurance fund underwrites).
-    /// Authority-only, bounded, opt-in, and REVERSIBLE (both 0 ⇒ full legacy
+    /// Authority-only, bounded, opt-in, and REVERSIBLE (both 0 ⇒ full default
     /// ±30% margin + 30% tail, the off-switch).
     ///
     /// Validated BEFORE any write, so leverage never outruns the fund:
@@ -7561,7 +7307,7 @@ pub mod clober {
         let im = market.params.initial_margin_ratio_bps;
         let max_lev = market.params.max_leverage;
 
-        // Off-switch: (0, 0) ⇒ full legacy (±30% margin lattice + 30% tail).
+        // Off-switch: (0, 0) ⇒ full default (±30% margin lattice + 30% tail).
         if worst_shock_bps == 0 && backstop_tail_bps == 0 {
             market.stress_shock_bps = 0;
             market.backstop_tail_bps = 0;
@@ -7586,12 +7332,12 @@ pub mod clober {
             );
         }
         let eff_shock = if worst_shock_bps == 0 {
-            constants::LEGACY_STRESS_SHOCK_BPS
+            constants::BASELINE_STRESS_SHOCK_BPS
         } else {
             worst_shock_bps
         };
         let eff_tail = if backstop_tail_bps == 0 {
-            constants::LEGACY_STRESS_SHOCK_BPS
+            constants::BASELINE_STRESS_SHOCK_BPS
         } else {
             backstop_tail_bps
         };
@@ -7599,7 +7345,7 @@ pub mod clober {
         // (2) tail underwrites a true black swan AND exceeds the margin shock ⇒
         // gap (tail − MM) strictly positive ⇒ backstop never vacuous.
         require!(
-            eff_tail >= constants::LEGACY_STRESS_SHOCK_BPS && eff_tail >= eff_shock,
+            eff_tail >= constants::BASELINE_STRESS_SHOCK_BPS && eff_tail >= eff_shock,
             CloberError::BackstopTailTooLow
         );
 
@@ -7737,7 +7483,7 @@ pub mod clober {
 
     /// Immediate market-params update — RESTRICTED.
     ///
-    /// This path may perform exactly ONE change: ENABLING a disabled (legacy,
+    /// This path may perform exactly ONE change: ENABLING a disabled (default,
     /// pre-bound-era) oracle-staleness gate — when the market's current
     /// `oracle_staleness_max_seconds == 0`, set it to a sane value in
     /// `[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]`. Every OTHER
@@ -7762,7 +7508,7 @@ pub mod clober {
             CloberError::Unauthorized
         );
 
-        // Only a DISABLED (legacy) staleness gate may be healed on the immediate
+        // Only a DISABLED (default) staleness gate may be healed on the immediate
         // path; an already-enabled bound changes only through the timelock.
         require!(
             market.params.oracle_staleness_max_seconds == 0,
@@ -8550,7 +8296,7 @@ pub mod clober {
             trader_state.orders_this_batch += 2;
         }
 
-        // V2 inject — into BOTH market_book PDAs.
+        // native inject — into BOTH market_book PDAs.
         let now_slot = Clock::get()?.slot;
         let trader_sub_index = ctx.accounts.trader_state.load()?.sub_index;
         let (seq_a, idx_a) = inject_leg_into_hypertree(
@@ -8570,7 +8316,7 @@ pub mod clober {
             trader_sub_index,
         )?;
 
-        emit!(BasketOrderPlacedV2Event {
+        emit!(BasketOrderPlacedEvent {
             trader: trader_key,
             market_a: market_a_key,
             market_b: market_b_key,
@@ -8711,7 +8457,7 @@ pub mod clober {
             )?;
         }
 
-        emit!(BasketOrderNPlacedV2Event {
+        emit!(BasketOrderNPlacedEvent {
             trader: trader_key,
             leg_count: legs.len() as u8,
             markets: market_keys.clone(),
@@ -9022,13 +8768,13 @@ pub mod clober {
         Ok(())
     }
 
-    /// HLP (pool-backed CLOB), increment 1b — post a resting LP maker quote onto
+    /// Post a resting liquidity-pool maker quote onto
     /// the book, owned by the pool (`trader = lp_exposure` PDA). A taker crossing
     /// it becomes a normal ring-committed BOOK fill (maker = the LP PDA), settled
     /// by the LP-maker settlement path — so the pool provides on-book liquidity
     /// that real MMs can improve on (a pool-backed passive maker, solving CLOB
-    /// cold-start). Authority-gated for now (the on-chain quoter drives this in a
-    /// later increment); POST-ONLY by construction — an LP quote must REST, so it
+    /// cold-start). Authority-gated; the on-chain quoter owns the refresh path.
+    /// POST-ONLY by construction — an LP quote must REST, so it
     /// is rejected if it would cross the opposite best (that would make the pool a
     /// taker against its own book). Moves no capital: pure book insertion.
     pub fn lp_post_maker_order(
@@ -9145,7 +8891,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// HLP (increment 2) — refresh the pool's on-book quotes. Reads the oracle +
+    /// Refresh the liquidity pool's on-book quotes. Reads the oracle +
     /// LP inventory and runs the SAME deterministic `lp_quoter::generate_quotes`
     /// the view exposes (Avellaneda-Stoikov inventory skew + spread model), then
     /// CANCELS the pool's stale resting quotes and POSTS the fresh two-sided
@@ -9297,7 +9043,7 @@ pub mod clober {
         // Post the fresh ladder (generate_quotes already priced/sized each level
         // and stamped trader = the pool PDA). Convert each matcher `Order` to a
         // `RestingOrder` and insert; sequence ids stay strictly increasing.
-        // INVENTORY CAP (increment 3): bound the pool's directional exposure —
+        // Inventory cap: bound the pool's directional exposure —
         // its net-position NOTIONAL must not exceed its capital (a conservative
         // ~1× limit; derived from live state, so no new market-params field). When
         // the pool sits at the cap on one side, DROP the quotes that would grow it
@@ -9370,106 +9116,76 @@ pub mod clober {
         taker_side: u8,
         taker_sub_index: u8,
         fill_seq: u64,
-        // HLP (1b): the taker's JIT flag, bound into the commitment preimage on
-        // the ring-authenticated path. Legacy sequencer callers pass `false`.
+        // liquidity pool (1b): the taker's JIT flag, bound into the commitment preimage on
+        // the ring-authenticated path. Default sequencer callers pass `false`.
         taker_was_jit: bool,
     ) -> Result<()> {
         require!(size_lots > 0, CloberError::ZeroSize);
         require!(price_ticks > 0, CloberError::ZeroPrice);
         require!(taker_side <= 1, CloberError::OutOfRange);
 
-        // ── Settlement authorization: RING-AUTHENTICATED (HLP) or SEQUENCER ──
-        // HLP (1b) pool-backed CLOB: when a taker crosses a resting LP quote
+        // ── Settlement authorization: commitment-ring authenticated ──
+        // liquidity pool (1b) pool-backed CLOB: when a taker crosses a resting LP quote
         // (`lp_post_maker_order`, maker = the lp_exposure PDA), `place_taker_
         // order` pushes a STANDARD fill commitment (maker = the LP PDA). If an
-        // armed market's fill-commitment ring is supplied here and the fill
+        // market's fill-commitment ring is supplied here and the fill
         // recomputes to the oldest pending commitment (verify-and-pop, FIFO), the
         // fill is AUTHENTIC — the pool can only settle exactly what the matcher
         // committed, to the committed taker, in order. That makes settlement
         // PERMISSIONLESS (any keeper), identical to the book-fill path.
-        // Otherwise (no commitment) this is a legacy sequencer-decided LP fill,
-        // gated on `market.sequencer` and bounded by the oracle band below.
-        let mut ring_authenticated = false;
         {
             let market_bytes = ctx.accounts.market.key().to_bytes();
-            if ctx.accounts.market.fill_commitment_required {
-                if let Some(fc_acct) =
-                    find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &market_bytes)
-                {
-                    use matcher::fill_commitment as fc;
-                    let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
-                    // The pool's on-book maker identity is the lp_exposure PDA;
-                    // LP quotes post with sub_index 0 (see `lp_post_maker_order`).
-                    let maker_bytes = ctx.accounts.lp_exposure.key().to_bytes();
-                    let mut fc_data = fc_acct.try_borrow_mut_data()?;
-                    let idx = fc::buffer_settle_index(&fc_data);
-                    let pre = fc::fill_preimage(
-                        &market_bytes,
-                        &taker_bytes,
-                        &maker_bytes,
-                        taker_side,
-                        size_lots,
-                        price_ticks,
-                        taker_sub_index,
-                        0, // maker_sub_index (LP orders post with sub_index 0)
-                        idx,
-                        taker_was_jit,
-                    );
-                    let recomputed = solana_keccak_hasher::hashv(&[&pre[..]]).0;
-                    fc::buffer_settle(&mut fc_data, &market_bytes, recomputed).map_err(
-                        |e| match e {
-                            fc::FillRingError::NotCommitted => {
-                                error!(CloberError::FillNotCommitted)
-                            }
-                            fc::FillRingError::Empty => error!(CloberError::FillRingEmpty),
-                            _ => error!(CloberError::FillRingCorrupt),
-                        },
-                    )?;
-                    ring_authenticated = true;
+            let fc_acct =
+                find_fill_commitment(ctx.remaining_accounts, ctx.program_id, &market_bytes)
+                    .ok_or_else(|| error!(CloberError::FillCommitmentMissing))?;
+            use matcher::fill_commitment as fc;
+            let taker_bytes = ctx.accounts.taker_trader_state.load()?.trader.to_bytes();
+            // The pool's on-book maker identity is the lp_exposure PDA;
+            // LP quotes post with sub_index 0 (see `lp_post_maker_order`).
+            let maker_bytes = ctx.accounts.lp_exposure.key().to_bytes();
+            let mut fc_data = fc_acct.try_borrow_mut_data()?;
+            let idx = fc::buffer_settle_index(&fc_data);
+            let pre = fc::fill_preimage(
+                &market_bytes,
+                &taker_bytes,
+                &maker_bytes,
+                taker_side,
+                size_lots,
+                price_ticks,
+                taker_sub_index,
+                0, // maker_sub_index (LP orders post with sub_index 0)
+                idx,
+                taker_was_jit,
+            );
+            let recomputed = solana_keccak_hasher::hashv(&[&pre[..]]).0;
+            fc::buffer_settle(&mut fc_data, &market_bytes, recomputed).map_err(|e| match e {
+                fc::FillRingError::NotCommitted => {
+                    error!(CloberError::FillNotCommitted)
                 }
-            }
+                fc::FillRingError::Empty => error!(CloberError::FillRingEmpty),
+                _ => error!(CloberError::FillRingCorrupt),
+            })?;
         }
-        // On an ARMED market the ring is MANDATORY — matching `apply_fill`.
-        // Were the commitment optional here, the sequencer could settle a
-        // fabricated LP fill via the legacy path, bounded only by the
-        // ±LP_MAX_FILL_DEVIATION_BPS oracle band — an asymmetric fabrication
-        // channel against LP capital. An armed market therefore requires
-        // `ring_authenticated`; only an UNARMED (legacy) market may use the
-        // sequencer + oracle-band path. All HLP/on-book LP fills are ring-crossed,
-        // so nothing legitimate depends on the armed sequencer fallback.
-        require!(
-            ring_authenticated
-                || (!ctx.accounts.market.fill_commitment_required
-                    && ctx.accounts.sequencer.key() == ctx.accounts.market.sequencer),
-            CloberError::Unauthorized
-        );
 
         // ── Monotonic replay guard (see apply_fill) ──────────────
         // The LP settlement nonce shares the SAME market counter as apply_fill,
         // so a replay of either path is rejected and the two interleave under a
         // single strictly-increasing sequence.
         //
-        // On the RING-AUTHENTICATED path the
-        // caller is permissionless, and a caller-controlled `fill_seq` is a
+        // The caller is permissionless, and a caller-controlled `fill_seq` is a
         // market-freeze DoS — one authentic fill settled with `fill_seq = u64::MAX`
         // wedges `last_settlement_seq` so every later settlement (`> u64::MAX`)
         // reverts forever. The ring already provides replay protection (verify-and-
         // pop, FIFO) and ordering, so the caller's nonce is redundant there:
         // auto-increment by 1 instead (deterministic, un-grief-able, ignores the
-        // arg). The legacy SEQUENCER path (trusted) keeps the supplied `fill_seq`.
-        ctx.accounts.market.last_settlement_seq = if ring_authenticated {
-            ctx.accounts
-                .market
-                .last_settlement_seq
-                .checked_add(1)
-                .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?
-        } else {
-            matcher::fill_commitment::advance_settlement_seq(
-                ctx.accounts.market.last_settlement_seq,
-                fill_seq,
-            )
-            .map_err(|_| error!(CloberError::FillSeqReplay))?
-        };
+        // arg).
+        let _ = fill_seq;
+        ctx.accounts.market.last_settlement_seq = ctx
+            .accounts
+            .market
+            .last_settlement_seq
+            .checked_add(1)
+            .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
         // Honest settlement-liveness signal (see apply_fill): an LP fill is a
         // real settlement, so advance it here too — never via settle_mark.
         ctx.accounts.market.last_settlement_slot = Clock::get()?.slot;
@@ -9492,41 +9208,6 @@ pub mod clober {
         // the pool. When a staleness bound is configured, require the oracle fresh
         // (and treat `published_at == 0` as stale → reject). `max_age == 0` is the
         // operator's explicit "no staleness gate".
-        // The oracle-band + staleness gate is the
-        // authenticity bound for LEGACY sequencer-decided LP fills. On the RING-
-        // AUTHENTICATED path the fill is already matcher-produced and its price is
-        // bound in the keccak commitment, so the band is redundant here — and worse,
-        // running it would let oracle drift between match-time (ER) and settle-time
-        // (L1) REJECT an authentic committed fill, stranding it at the head of the
-        // SHARED FIFO ring and blocking every later settlement (book + LP). Skip it
-        // on the ring path; keep it as the sole authenticity bound on the legacy path.
-        if !ring_authenticated {
-            let max_age = ctx.accounts.market.params.oracle_staleness_max_seconds as u64;
-            if max_age > 0 {
-                let now = Clock::get()?.unix_timestamp.max(0) as u64;
-                let published = ctx.accounts.market.oracle_published_at_unix_seconds;
-                require!(
-                    published != 0 && now.saturating_sub(published) <= max_age,
-                    CloberError::OracleTooStale
-                );
-            }
-            // `price_within_band` returns true when the oracle
-            // anchor is 0, so a zero oracle on the legacy (unarmed) path would leave
-            // the LP fill price entirely unbounded. Require a real anchor — fail
-            // closed rather than admit an arbitrary sequencer-signed price.
-            require!(
-                ctx.accounts.market.oracle_price_ticks > 0,
-                CloberError::OracleTooStale
-            );
-            require!(
-                matcher::lp_quoter::price_within_band(
-                    ctx.accounts.market.oracle_price_ticks,
-                    price_ticks,
-                    crate::constants::LP_MAX_FILL_DEVIATION_BPS,
-                ),
-                CloberError::LpPriceOutsideBand
-            );
-        }
         // On a haircut-enabled market the haircut accounts
         // are MANDATORY (LP path has market + taker only — LP is the maker), so a
         // settlement can't omit them to route the taker's PnL past the solvency gate.
@@ -9543,6 +9224,25 @@ pub mod clober {
         require!(
             !ctx.accounts.market.is_permissionless || ctx.accounts.market.haircut_enabled,
             CloberError::HaircutNotInitialized
+        );
+
+        let now = Clock::get()?.unix_timestamp.max(0) as u64;
+        let oracle_max_age = ctx.accounts.market.params.oracle_staleness_max_seconds as u64;
+        if oracle_max_age > 0 {
+            let published = ctx.accounts.market.oracle_published_at_unix_seconds;
+            require!(published > 0, CloberError::OracleTooStale);
+            require!(
+                now.saturating_sub(published) <= oracle_max_age,
+                CloberError::OracleTooStale
+            );
+        }
+        require!(
+            matcher::lp_quoter::price_within_band(
+                ctx.accounts.market.oracle_price_ticks,
+                price_ticks,
+                crate::constants::LP_MAX_FILL_DEVIATION_BPS,
+            ),
+            CloberError::LpPriceOutsideBand
         );
 
         // Verify the trader_state PDA matches
@@ -9564,11 +9264,9 @@ pub mod clober {
         )?;
 
         let market = &mut ctx.accounts.market;
-        // This LP fill (pushed to the ring by place_taker) has settled ⇒
-        // release the OI volume place_taker reserved for it. Only on the ring path.
-        if ring_authenticated {
-            market.unsettled_fill_volume = market.unsettled_fill_volume.saturating_sub(size_lots);
-        }
+        // Every LP fill is commitment-backed, so release the OI volume reserved
+        // by `place_taker_order` when it settles.
+        market.unsettled_fill_volume = market.unsettled_fill_volume.saturating_sub(size_lots);
         let market_key = market.key();
         let funding_index = market.cum_funding_index;
         let current_batch = market.current_batch;
@@ -9915,7 +9613,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// V2: liquidate an unhealthy position by injecting a synthetic
+    /// native: liquidate an unhealthy position by injecting a synthetic
     /// close order into the hypertree-backed book.
     ///
     /// Applies the liquidation pipeline: cooldown gate, stress-lattice
@@ -9923,8 +9621,8 @@ pub mod clober {
     /// limit pricing, and position timing updates, injecting the close
     /// order into the hypertree book. The order_type byte is set
     /// to 3 (Liquidation) so the matcher's FIFO mapping (mirror of
-    /// v1's `slot_to_order`) places it AHEAD of regular limits at
-    /// the same price tier — same priority semantics as v1.
+    /// current's `slot_to_order`) places it AHEAD of regular limits at
+    /// the same price tier — same priority semantics as current.
     pub fn liquidate_position(
         ctx: Context<LiquidatePosition>,
         requested_close_lots: u64,
@@ -10050,7 +9748,7 @@ pub mod clober {
         // hasn't moved for more than MARK_STALENESS_MAX_SLOTS (via the fill-EMA
         // in apply_fill OR a settle_mark), drop it and price health off the
         // FRESH oracle alone (the oracle freshness gate above already enforced
-        // the oracle isn't stale when configured). A 0 freshness slot (legacy /
+        // the oracle isn't stale when configured). A 0 freshness slot (default /
         // never-stamped market) is treated as stale ⇒ oracle-only too.
         let mark_stale = market.last_mark_update_slot == 0
             || current_slot.saturating_sub(market.last_mark_update_slot)
@@ -10451,7 +10149,7 @@ pub mod clober {
             require!(!already_resting, CloberError::RateLimited);
         }
 
-        // Dutch-auction reward (parity-port from v1).
+        // Dutch-auction reward (parity-port from current).
         let mut reward_paid: u64 = 0;
         if market.params.liquidator_reward_bps > 0 {
             // Reward notional off the freshness-gated health
@@ -10564,7 +10262,7 @@ pub mod clober {
             }
         }
 
-        // V2 inject — into the hypertree, with order_type = Liquidation (3).
+        // native inject — into the hypertree, with order_type = Liquidation (3).
         // `trader` was hoisted above the reward block.
         let close_side_u8 = close_side as u8;
         let inserted_idx;
@@ -10612,7 +10310,7 @@ pub mod clober {
             position.last_liquidated_at_slot = current_slot;
         }
 
-        emit!(LiquidationInjectedV2Event {
+        emit!(LiquidationInjectedEvent {
             market: market_key,
             trader,
             side: pos_side as u8,
@@ -11000,7 +10698,7 @@ pub mod clober {
 
         // ── route the counter gain ─────────────────────────
         // Isolated counter → credit the per-position bucket.
-        // Cross counter    → credit the cross pool (legacy path).
+        // Cross counter    → credit the cross pool (default path).
         {
             let (new_pos_collat, new_ts_collat) = route_adl_gain(
                 counter_isolated,
@@ -11456,7 +11154,7 @@ pub mod clober {
             };
         }
 
-        emit!(LiquidationInjectedV2Event {
+        emit!(LiquidationInjectedEvent {
             market: market_key,
             trader,
             side: pos_side as u8,
@@ -11474,7 +11172,7 @@ pub mod clober {
     // in-house CPI wrappers in `src/er.rs`. lp_exposure is intentionally
     // NOT ER-delegatable: it's a singleton, so delegating it would
     // bottleneck ALL markets to a single ER instance. Per-market LP
-    // exposure lives in the v3 `LpMarketExposureAccount` PDAs.
+    // exposure lives in the native `LpMarketExposureAccount` PDAs.
 
     // ─── Monolithic ixs (merged from former wrapper programs) ─────
     //
@@ -11486,9 +11184,9 @@ pub mod clober {
     // ixs do their work directly without invoke_signed across program
     // boundaries.
 
-    // ─── Trigger orders v3 ──────────────────────────────────────────
+    // ─── Trigger orders native ──────────────────────────────────────────
 
-    /// Create a v3 trigger order PDA. Same trigger semantics as
+    /// Create a trigger order PDA. Same trigger semantics as
     /// `execute_trigger_order` (validates side / kind / size / price /
     /// tick alignment / expiry).
     /// PDA seeds: `[b"trigger", market, trader, trigger_id]`.
@@ -11504,7 +11202,7 @@ pub mod clober {
         reduce_only: bool,
         expires_at_slot: u64,
         sub_index: u8,
-        // Slippage cap. 0 = no cap (legacy behavior).
+        // Slippage cap. 0 = no cap (default behavior).
         // For side==0 (long buying): cap = MAX admissible oracle price
         //   at execution time. Trigger refuses to fire if oracle > cap.
         // For side==1 (short selling): cap = MIN admissible oracle.
@@ -11601,7 +11299,7 @@ pub mod clober {
         trigger.sibling_trigger_id = 0;
         trigger._reserved = [0; 7];
 
-        emit!(TriggerOrderV3PlacedEvent {
+        emit!(TriggerOrderPlacedEvent {
             market: market.key(),
             trader: trigger.trader,
             trigger_id,
@@ -11614,7 +11312,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Execute a v3 trigger — validates fire condition then injects the
+    /// Execute a trigger — validates fire condition then injects the
     /// resulting limit order into the hypertree directly (no CPI). The
     /// caller is permissionless; trader was pre-authorized at placement.
     pub fn execute_trigger_order(ctx: Context<ExecuteTriggerOrder>) -> Result<()> {
@@ -11630,8 +11328,8 @@ pub mod clober {
             require!(trigger.expires_at_slot >= now, CloberError::OutOfRange);
         }
 
-        // Oracle staleness gate on v3 trigger execution. Same rationale as
-        // the v2 path. An unstamped oracle (published_at == 0) is treated as
+        // Oracle staleness gate on trigger execution. Same rationale as
+        // the native path. An unstamped oracle (published_at == 0) is treated as
         // STALE, not skipped: gating on `published > 0` would fail OPEN on a
         // never-updated oracle, and with oracle_price_ticks == 0 a kind-0
         // trigger (`oracle <= trigger_price`) would fire unconditionally on a
@@ -11667,7 +11365,7 @@ pub mod clober {
             let acceptable_price = trigger.acceptable_price_ticks;
             let trigger_mut = &mut ctx.accounts.trigger_order;
             trigger_mut.flags &= !extended_state::TriggerOrderAccount::FLAG_ACTIVE;
-            emit!(TriggerOrderV3SlippageCancelledEvent {
+            emit!(TriggerOrderSlippageCancelledEvent {
                 market: market_key,
                 trader: trader_pk,
                 trigger_id,
@@ -11720,7 +11418,7 @@ pub mod clober {
         // A REDUCE-ONLY trigger's injected close order must not
         // rest indefinitely — if the position closes between fire and fill, a GTC
         // order would later OPEN/FLIP a fresh position against the trader's intent.
-        // The v2 CLOB can't enforce reduce-only at settlement (see the constant), so
+        // The native CLOB can't enforce reduce-only at settlement (see the constant), so
         // bound the order's life: the matcher skips expired resting orders, capping
         // the flip window at REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS. Entry (non-reduce-
         // only) triggers rest until filled (0 = GTC), where a "flip" is the intent.
@@ -11763,7 +11461,7 @@ pub mod clober {
         // idiom and this handler is a per-fire keeper call, not the matcher walk.
         // Scale-out is preserved (partial exits summing ≤ position all fit); only
         // genuine over-capacity is trimmed. (A residual — a position SHRUNK below its
-        // already-resting reduce-only after injection — is closed by the v1
+        // already-resting reduce-only after injection — is closed by the current
         // fill-commitment reduce-in-flight tracking on upgraded markets; see
         // docs/SETTLEMENT.md §3. That path is far narrower: a deliberate
         // self-shrink-then-overhang self-cross.)
@@ -11804,7 +11502,7 @@ pub mod clober {
         // bind the caller-supplied TraderState to the trigger's
         // trader, then gate the injected order (reduce-only exempt via is_reduce_only,
         // so a reduce-close still fires; an OPENING entry must be backed). Mirrors
-        // place_limit_v2_core; the position is already trigger-bound above.
+        // place_limit_core; the position is already trigger-bound above.
         require!(
             ctx.accounts.trader_state.load()?.trader == trader_pk,
             CloberError::WrongTrader
@@ -11895,7 +11593,7 @@ pub mod clober {
             sibling.flags &= !extended_state::TriggerOrderAccount::FLAG_ACTIVE;
         }
 
-        emit!(TriggerOrderV3ExecutedEvent {
+        emit!(TriggerOrderExecutedEvent {
             market: market_key,
             trader: trader_pk,
             trigger_id,
@@ -11907,14 +11605,14 @@ pub mod clober {
         Ok(())
     }
 
-    /// Cancel a v3 trigger and close the account, refunding rent.
+    /// Cancel a trigger and close the account, refunding rent.
     pub fn cancel_trigger_order(ctx: Context<CancelTriggerOrder>) -> Result<()> {
         let trader = ctx.accounts.trader.key();
         require!(
             ctx.accounts.trigger_order.trader == trader,
             CloberError::WrongTrader
         );
-        emit!(TriggerOrderV3CancelledEvent {
+        emit!(TriggerOrderCancelledEvent {
             market: ctx.accounts.trigger_order.market,
             trader,
             trigger_id: ctx.accounts.trigger_order.trigger_id,
@@ -11922,9 +11620,9 @@ pub mod clober {
         Ok(())
     }
 
-    // ─── TWAP orders v3 ─────────────────────────────────────────────
+    // ─── TWAP orders native ─────────────────────────────────────────────
 
-    /// Create a v3 TWAP order PDA.
+    /// Create a TWAP order PDA.
     #[allow(clippy::too_many_arguments)]
     pub fn place_twap_order(
         ctx: Context<PlaceTwapOrder>,
@@ -12019,7 +11717,7 @@ pub mod clober {
         twap.acceptable_price_ticks = acceptable_price_ticks;
         twap._reserved = [0; 7];
 
-        emit!(TwapOrderV3PlacedEvent {
+        emit!(TwapOrderPlacedEvent {
             market: market.key(),
             trader: twap.trader,
             twap_id,
@@ -12088,7 +11786,7 @@ pub mod clober {
             twap.side,
             oracle,
         ) {
-            emit!(TwapSliceV3SlippageSkippedEvent {
+            emit!(TwapSliceSlippageSkippedEvent {
                 market: market.key(),
                 trader: twap.trader,
                 twap_id: twap.twap_id,
@@ -12182,7 +11880,7 @@ pub mod clober {
             twap.flags &= !extended_state::TwapOrderAccount::FLAG_ACTIVE;
         }
 
-        emit!(TwapSliceV3ExecutedEvent {
+        emit!(TwapSliceExecutedEvent {
             market: market_key,
             trader: trader_pk,
             twap_id,
@@ -12195,7 +11893,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Cancel a v3 TWAP order and close the account.
+    /// Cancel a TWAP order and close the account.
     pub fn cancel_twap_order(ctx: Context<CancelTwapOrder>) -> Result<()> {
         let trader = ctx.accounts.trader.key();
         require!(
@@ -12207,7 +11905,7 @@ pub mod clober {
             .twap_order
             .total_size_lots
             .saturating_sub(ctx.accounts.twap_order.size_executed_lots);
-        emit!(TwapOrderV3CancelledEvent {
+        emit!(TwapOrderCancelledEvent {
             market: ctx.accounts.twap_order.market,
             trader,
             twap_id: ctx.accounts.twap_order.twap_id,
@@ -12216,9 +11914,9 @@ pub mod clober {
         Ok(())
     }
 
-    // ─── Iceberg orders v3 ──────────────────────────────────────────
+    // ─── Iceberg orders native ──────────────────────────────────────────
 
-    /// Create a v3 iceberg + seed first visible chunk directly into the
+    /// Create a iceberg + seed first visible chunk directly into the
     /// hypertree.
     #[allow(clippy::too_many_arguments)]
     pub fn place_iceberg_order(
@@ -12277,7 +11975,7 @@ pub mod clober {
         let first_chunk = displayed_size_lots.min(total_size_lots);
 
         // the visible chunk OPENS exposure and settlement cannot
-        // re-check margin, so gate it now exactly like place_limit_v2_core (reduces
+        // re-check margin, so gate it now exactly like place_limit_core (reduces
         // are exempt inside the helper; None position ⇒ full-open, strictest).
         let ts_key = ctx.accounts.trader_state.key();
         gate_injection_open(
@@ -12350,7 +12048,7 @@ pub mod clober {
         iceberg.created_at_slot = now;
         iceberg.expires_at_slot = expires_at_slot;
 
-        emit!(IcebergOrderV3PlacedEvent {
+        emit!(IcebergOrderPlacedEvent {
             market: market_key,
             trader: trader_pk,
             iceberg_id,
@@ -12363,7 +12061,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Replenish v3 iceberg's next chunk — permissionless keeper.
+    /// Replenish iceberg's next chunk — permissionless keeper.
     pub fn replenish_iceberg(ctx: Context<ReplenishIceberg>) -> Result<()> {
         let iceberg = &ctx.accounts.iceberg_order;
         let market = &ctx.accounts.market;
@@ -12480,7 +12178,7 @@ pub mod clober {
             iceberg.flags &= !extended_state::IcebergOrderAccount::FLAG_ACTIVE;
         }
 
-        emit!(IcebergV3ReplenishedEvent {
+        emit!(IcebergReplenishedEvent {
             market: market_key,
             trader: trader_pk,
             iceberg_id,
@@ -12491,7 +12189,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// Cancel a v3 iceberg and close the account.
+    /// Cancel a iceberg and close the account.
     pub fn cancel_iceberg(ctx: Context<CancelIceberg>) -> Result<()> {
         let trader = ctx.accounts.trader.key();
         require!(
@@ -12503,7 +12201,7 @@ pub mod clober {
             .iceberg_order
             .remaining_lots
             .saturating_add(ctx.accounts.iceberg_order.displayed_size_lots);
-        emit!(IcebergV3CancelledEvent {
+        emit!(IcebergCancelledEvent {
             market: ctx.accounts.iceberg_order.market,
             trader,
             iceberg_id: ctx.accounts.iceberg_order.iceberg_id,
@@ -12512,7 +12210,7 @@ pub mod clober {
         Ok(())
     }
 
-    // ─── Bracket orders v3 ──────────────────────────────────────────
+    // ─── Bracket orders native ──────────────────────────────────────────
 
     /// Atomic bracket: parent limit order + 2 OCO-linked TP/SL triggers.
     #[allow(clippy::too_many_arguments)]
@@ -12602,7 +12300,7 @@ pub mod clober {
         let trader_pk = ctx.accounts.trader.key();
         let market_key = market.key();
 
-        // gate the OPENING parent leg exactly like place_limit_v2_core
+        // gate the OPENING parent leg exactly like place_limit_core
         // (the TP/SL legs are reduce-only and exempt). None position ⇒ full-open.
         let ts_key = ctx.accounts.trader_state.key();
         gate_injection_open(
@@ -12704,7 +12402,7 @@ pub mod clober {
         sl.sub_index = sub_index;
         sl.sibling_trigger_id = tp_trigger_id;
 
-        emit!(BracketOrderV3PlacedEvent {
+        emit!(BracketOrderPlacedEvent {
             market: market_key,
             trader: trader_pk,
             parent_side,
@@ -12718,7 +12416,7 @@ pub mod clober {
         Ok(())
     }
 
-    // ─── Vaults v3 ──────────────────────────────────────────────────
+    // ─── Vaults native ──────────────────────────────────────────────────
 
     /// Strategist creates a new vault. Vault id is per-strategist (0..255).
     pub fn create_vault(
@@ -12743,7 +12441,7 @@ pub mod clober {
         v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
         v.total_perf_shares_minted = 0;
 
-        emit!(VaultV3CreatedEvent {
+        emit!(VaultCreatedEvent {
             vault: v.key(),
             strategist: v.strategist,
             vault_id,
@@ -12782,7 +12480,7 @@ pub mod clober {
             s.volume_window_start_slot = slot;
         }
 
-        emit!(VaultTraderStateOpenedV3Event {
+        emit!(VaultTraderStateOpenedEvent {
             vault: vault_key,
             vault_trader_state: ctx.accounts.vault_trader_state.key(),
         });
@@ -12834,7 +12532,7 @@ pub mod clober {
         let vault = &mut ctx.accounts.vault;
         // Bootstrap 1:1 only when there are no shares yet.
         // Shares outstanding against a zero-NAV (fully-drained) vault would
-        // dilute the new depositor into worthless legacy shares — reject.
+        // dilute the new depositor into worthless default shares — reject.
         require!(
             !(vault.shares_outstanding > 0 && pre_deposit_nav == 0),
             CloberError::LpPoolInsolvent
@@ -12874,7 +12572,7 @@ pub mod clober {
             .checked_add(amount_quote_lots)
             .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
 
-        emit!(VaultDepositV3Event {
+        emit!(VaultDepositEvent {
             vault: vault.key(),
             depositor: pos.depositor,
             amount_quote_lots,
@@ -12908,7 +12606,7 @@ pub mod clober {
             .collateral_quote_lots as u128;
         require!(live_nav > 0, CloberError::InsufficientCollateral);
 
-        // A v3 vault holds open positions
+        // A vault holds open positions
         // (`vault_place_order`), and `live_nav = collateral_quote_lots` ignores
         // unrealized loss. Without a gate, early depositors burn shares and exit at
         // the inflated NAV, pulling the collateral that backs the open position and
@@ -12974,7 +12672,7 @@ pub mod clober {
             CpiContext::new_with_signer(ctx.accounts.token_program.key(), cpi_accounts, signers);
         token::transfer(cpi_ctx, amount)?;
 
-        emit!(VaultWithdrawV3Event {
+        emit!(VaultWithdrawEvent {
             vault: vault_key,
             depositor: depositor_key,
             shares_burned: shares_to_burn,
@@ -13044,7 +12742,7 @@ pub mod clober {
         );
 
         // gate the vault's OPENING order against its own TraderState
-        // collateral, exactly like place_limit_v2_core. A reduce-only order is exempt
+        // collateral, exactly like place_limit_core. A reduce-only order is exempt
         // (it can only wind down — `is_reduce_only` is passed through so
         // `assert_injection_intake` returns early). None position ⇒ full-open. Closes the
         // vault under-margined-open leak.
@@ -13112,7 +12810,7 @@ pub mod clober {
             handle.insert_ask(order)?
         };
 
-        emit!(VaultOrderPlacedV3Event {
+        emit!(VaultOrderPlacedEvent {
             vault: vault_pk,
             market: market_key,
             side,
@@ -13165,7 +12863,7 @@ pub mod clober {
             handle.remove_ask_node(idx);
         }
 
-        emit!(VaultOrderCancelledV3Event {
+        emit!(VaultOrderCancelledEvent {
             vault: vault_pk,
             market: market_key,
             side,
@@ -13275,7 +12973,7 @@ pub mod clober {
         };
         v.last_perf_settlement_unix = Clock::get()?.unix_timestamp.max(0) as u64;
 
-        emit!(VaultPerfFeeSettledV3Event {
+        emit!(VaultPerfFeeSettledEvent {
             vault: vault_key,
             strategist: v.strategist,
             shares_minted: shares_to_mint,
@@ -13284,7 +12982,7 @@ pub mod clober {
         Ok(())
     }
 
-    // ─── Per-market LP v3 ──────────────────────────────────────────
+    // ─── Per-market LP native ──────────────────────────────────────────
 
     /// Initialize a per-market LP exposure account. Authority-only.
     pub fn init_lp_per_market(ctx: Context<InitLpPerMarket>) -> Result<()> {
@@ -13378,16 +13076,16 @@ pub mod clober {
         require!(amount_quote_lots > 0, CloberError::ZeroSize);
 
         // LP-system lock: mutually exclusive with the singleton pool over the
-        // shared vault. Claim the v3 mode on the first mint; reject if the
+        // shared vault. Claim the native mode on the first mint; reject if the
         // singleton has already claimed it. Checked before any funds move.
         {
             let m = &mut ctx.accounts.lp_mode;
             if m.mode == state::LpModeAccount::MODE_UNSET {
-                m.mode = state::LpModeAccount::MODE_V3;
+                m.mode = state::LpModeAccount::MODE_PER_MARKET;
                 m.bump = ctx.bumps.lp_mode;
             } else {
                 require!(
-                    m.mode == state::LpModeAccount::MODE_V3,
+                    m.mode == state::LpModeAccount::MODE_PER_MARKET,
                     CloberError::LpSystemModeConflict
                 );
             }
@@ -13408,7 +13106,7 @@ pub mod clober {
         // standing LPs, and one entering against an unrealized LOSS would
         // under-mint; either way realized-only NAV misprices the entry. A stale
         // oracle fails closed here exactly as it does for the singleton.
-        let mtm: i128 = lp_v3_inventory_mtm(
+        let mtm: i128 = lp_market_inventory_mtm(
             ctx.accounts.exposure.side,
             ctx.accounts.exposure.size_lots,
             ctx.accounts.exposure.entry_price_ticks,
@@ -13520,7 +13218,7 @@ pub mod clober {
         let side = ctx.accounts.exposure.side;
         let size_lots = ctx.accounts.exposure.size_lots;
         let entry_ticks = ctx.accounts.exposure.entry_price_ticks;
-        let mtm: i128 = lp_v3_inventory_mtm(
+        let mtm: i128 = lp_market_inventory_mtm(
             side,
             size_lots,
             entry_ticks,
@@ -13720,114 +13418,6 @@ pub mod clober {
             maker,
             nonce: ctx.accounts.jit_offer.nonce,
             unfilled_size_lots: ctx.accounts.jit_offer.remaining_size_lots,
-        });
-        Ok(())
-    }
-
-    /// Migrate a market account from the legacy 1024-B mark-engine layout
-    /// to the extended 1152-B layout, which added `last_mark_settle_slot` plus
-    /// four mark-engine params (mark_ema_alpha_bps, mark_max_change_bps,
-    /// mark_settle_min_slots, drift_alert_bps).
-    ///
-    /// Idempotent: if the account is already at the extended-layout size and the mark-engine
-    /// params look set, returns Ok with a log message and no state change.
-    ///
-    /// Authority-gated: only `market.authority` may call.
-    pub fn migrate_market_layout(ctx: Context<MigrateMarketLayout>) -> Result<()> {
-        let market_ai = &ctx.accounts.market;
-        let target_size = MarketAccount::space();
-        let current_size = market_ai.data_len();
-        let authority_key = ctx.accounts.authority.key();
-
-        // Defence in depth: target_size is computed from MarketAccount::space()
-        // which is compile-time bounded by the type layout, BUT a future
-        // schema change that inadvertently bloats MarketAccount past Solana's
-        // 10 MB account ceiling would otherwise blow up inside the runtime.
-        // Refuse at the boundary so the error is legible and the tx's compute
-        // budget isn't burned reaching a deeper panic.
-        require!(
-            target_size <= constants::SOLANA_MAX_ACCOUNT_SIZE,
-            CloberError::OutOfRange
-        );
-
-        // Already migrated?
-        if current_size == target_size {
-            // Check the extended-layout fields are populated (mark_ema_alpha_bps != 0 indicates a
-            // post-migration account). If zeroed, fall through and write defaults.
-            let data = market_ai.try_borrow_data()?;
-            let mut market: MarketAccount = MarketAccount::try_deserialize(&mut &data[..])?;
-            drop(data);
-            require!(market.authority == authority_key, CloberError::Unauthorized);
-            if market.params.mark_ema_alpha_bps != 0 {
-                msg!(
-                    "migrate_market_layout: account already V3 (size={}, alpha={})",
-                    current_size,
-                    market.params.mark_ema_alpha_bps
-                );
-                return Ok(());
-            }
-            // Size OK but params zeroed — write defaults
-            market.params.mark_ema_alpha_bps = 2_000;
-            market.params.mark_max_change_bps = 500;
-            market.params.mark_settle_min_slots = 10;
-            market.params.drift_alert_bps = 100;
-            if market.last_mark_settle_slot == 0 {
-                market.last_mark_settle_slot = Clock::get()?.slot;
-            }
-            let mut data = market_ai.try_borrow_mut_data()?;
-            let mut writer = &mut data[..];
-            market.try_serialize(&mut writer)?;
-            emit!(MarketMigratedToV3Event {
-                market: market_ai.key(),
-                old_size: current_size as u32,
-                new_size: target_size as u32,
-                slot: Clock::get()?.slot,
-            });
-            return Ok(());
-        }
-
-        require!(current_size < target_size, CloberError::AlreadyInitialized);
-
-        // 1. Read OLD bytes — deserialize using try_deserialize_unchecked which
-        //    skips the size check (the discriminator must still match).
-        let old_bytes = market_ai.try_borrow_data()?.to_vec();
-        let mut market: MarketAccount =
-            MarketAccount::try_deserialize_unchecked(&mut &old_bytes[..])?;
-        require!(market.authority == authority_key, CloberError::Unauthorized);
-
-        // 2. Realloc to the extended-layout size. Fund the rent diff from the authority.
-        let new_minimum_balance = Rent::get()?.minimum_balance(target_size);
-        let lamports_diff = new_minimum_balance.saturating_sub(market_ai.lamports());
-        if lamports_diff > 0 {
-            let cpi_ctx = CpiContext::new(
-                ctx.accounts.system_program.key(),
-                anchor_lang::system_program::Transfer {
-                    from: ctx.accounts.authority.to_account_info(),
-                    to: market_ai.to_account_info(),
-                },
-            );
-            anchor_lang::system_program::transfer(cpi_ctx, lamports_diff)?;
-        }
-        market_ai.resize(target_size)?;
-
-        // 3. Write extended-layout defaults
-        market.params.mark_ema_alpha_bps = 2_000;
-        market.params.mark_max_change_bps = 500;
-        market.params.mark_settle_min_slots = 10;
-        market.params.drift_alert_bps = 100;
-        market.last_mark_settle_slot = Clock::get()?.slot;
-
-        // 4. Serialize back
-        let mut data = market_ai.try_borrow_mut_data()?;
-        let mut writer = &mut data[..];
-        market.try_serialize(&mut writer)?;
-        drop(data);
-
-        emit!(MarketMigratedToV3Event {
-            market: market_ai.key(),
-            old_size: current_size as u32,
-            new_size: target_size as u32,
-            slot: Clock::get()?.slot,
         });
         Ok(())
     }
@@ -15193,7 +14783,7 @@ fn credit_collateral(
 /// `pub`), so Anchor does not dispatch it. Body is byte-identical to the
 /// pre-extraction handler, guarded by the full place/proptest/integration suite.
 #[allow(clippy::too_many_arguments)]
-fn place_limit_v2_core(
+fn place_limit_core(
     market: &Account<'_, MarketAccount>,
     market_book: &UncheckedAccount<'_>,
     trader_pk: Pubkey,
@@ -15447,7 +15037,7 @@ fn place_limit_v2_core(
         handle.insert_ask(order)?
     };
 
-    emit!(OrderPlacedV2Event {
+    emit!(OrderPlacedEvent {
         market: market_key,
         trader: trader_pk,
         seq,
@@ -15465,7 +15055,7 @@ fn place_limit_v2_core(
 /// pre-extraction `cancel_order` handler; ownership is enforced against the
 /// resting order's recorded `trader`, so a session can only cancel its OWNER's
 /// orders. Guarded by the full integration/proptest suite.
-fn cancel_v2_core(
+fn cancel_order_core(
     market_book: &UncheckedAccount<'_>,
     market_key: Pubkey,
     trader_pk: Pubkey,
@@ -15514,7 +15104,7 @@ fn cancel_v2_core(
         handle.remove_ask_node(idx);
     }
 
-    emit!(OrderCancelledV2Event {
+    emit!(OrderCancelledEvent {
         market: market_key,
         trader: trader_pk,
         order_seq,
@@ -15586,8 +15176,8 @@ fn initialize_market_inner(
 /// (`initialize_market`) and the permissionless path
 /// (`create_permissionless_market`). Sets every `MarketAccount` field to its
 /// genesis value; `creator` and `is_permissionless` differ per path. The
-/// sequencer defaults to `authority` and the market is fail-closed
-/// (`fill_commitment_required = true`) until armed.
+/// sequencer defaults to `authority` and the market is fail-closed until its
+/// commitment ring is initialized.
 #[allow(clippy::too_many_arguments)]
 fn write_market_genesis(
     market: &mut MarketAccount,
@@ -15647,13 +15237,8 @@ fn write_market_genesis(
     // via `set_market_sequencer` before burning authority so fills keep
     // settling after decentralization.
     market.sequencer = authority;
-    // fill-commitment authenticity is MANDATORY by default. A new market
-    // is fail-closed — `apply_fill` / `place_taker_order` reject any settlement
-    // until the market is armed with a ring (`init_fill_commitment`), so a
-    // compromised sequencer can never fabricate fills on an "un-armed" market. The
-    // flag is sticky (only ever set true); the operator arms each market before
-    // enabling settlement.
-    market.fill_commitment_required = true;
+    // Settlement is fail-closed until the operator initializes the
+    // per-market commitment ring.
 
     emit!(MarketInitializedEvent {
         market: market_key,
@@ -15670,7 +15255,7 @@ pub struct InitializeMarket<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    /// CHECK: base mint account; not validated as SPL here for v1.
+    /// CHECK: base mint account; not validated as SPL here for current.
     pub base_mint: UncheckedAccount<'info>,
     /// CHECK: quote mint account.
     pub quote_mint: UncheckedAccount<'info>,
@@ -15715,8 +15300,8 @@ pub struct InitializeMarket<'info> {
 
 /// HIP-3 permissionless-market creation. Identical to `InitializeMarket` EXCEPT
 /// the signer is any `creator` (no `insurance_fund.authority == signer` gate).
-/// This is safe because: (1) the market is armed by default
-/// (`fill_commitment_required = true`) so the creator-as-sequencer cannot
+/// This is safe because: (1) the commitment ring is mandatory, so the
+/// creator-as-sequencer cannot
 /// fabricate fills — apply_fill requires a real keccak commitment from a book
 /// crossing, else `FillNotCommitted`; (2) `validate_hip3_params` clamps the
 /// params; (3) `is_permissionless` isolates the market's bad debt from the shared
@@ -15792,7 +15377,7 @@ pub struct PlaceLimitOrder<'info> {
     // non-existent TraderState (which would permanently wedge settlement). Existence
     // is enforced by AccountLoader (program-owned + valid discriminator); the PDA
     // binding to (trader, sub_index) and `trader` ownership are checked in-handler
-    // by `place_limit_v2_core` via `verify_trader_state_pda` (which handles the
+    // by `place_limit_core` via `verify_trader_state_pda` (which handles the
     // sub_index==0-vs->0 seed branch). Read-only.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
@@ -15804,7 +15389,7 @@ pub struct PlaceLimitOrder<'info> {
     pub position: Option<AccountLoader<'info, state::PositionAccount>>,
     // The optional per-market FillCommitmentAccount is passed
     // via `remaining_accounts` (truly optional — existing callers pass nothing
-    // and keep legacy behaviour; an armed market appends the account). Located +
+    // and keep default behaviour; an armed market appends the account). Located +
     // validated in-handler by `find_fill_commitment`.
 }
 
@@ -15812,7 +15397,7 @@ pub struct PlaceLimitOrder<'info> {
 /// an ephemeral `session_signer` instead of the trader; the `session_token`
 /// (seed-bound to its owner + signer) is verified in-handler.
 #[derive(Accounts)]
-pub struct PlaceLimitOrderV2Session<'info> {
+pub struct PlaceLimitOrderSession<'info> {
     /// The ephemeral session key. Must equal `session_token.session_signer`.
     pub session_signer: Signer<'info>,
 
@@ -15840,7 +15425,7 @@ pub struct PlaceLimitOrderV2Session<'info> {
 
     // TraderState for (session_token.owner, sub_index). See
     // PlaceLimitOrder — same anti-wedge existence + PDA binding, validated in
-    // `place_limit_v2_core` against the session's owner identity.
+    // `place_limit_core` against the session's owner identity.
     pub trader_state: AccountLoader<'info, TraderStateAccount>,
 
     // OPTIONAL position for the intake initial-margin gate.
@@ -15949,7 +15534,7 @@ pub struct RetireLiquidationOrder<'info> {
 /// SESSION-KEY cancel. Mirror of `CancelOrder` but signed by an ephemeral
 /// `session_signer`; the `session_token` is seed-bound + verified in-handler.
 #[derive(Accounts)]
-pub struct CancelOrderV2Session<'info> {
+pub struct CancelOrderSession<'info> {
     pub session_signer: Signer<'info>,
 
     #[account(
@@ -16324,7 +15909,7 @@ pub struct VerifyCollateralSolvency<'info> {
     pub quote_vault: Account<'info, TokenAccount>,
 
     /// Optional — when supplied, its `residual` is checked
-    /// to be backed by the vault surplus. `None` = legacy behavior (backward
+    /// to be backed by the vault surplus. `None` = default behavior (backward
     /// compatible; existing callers are unaffected).
     pub haircut_state: Option<Account<'info, extended_state::MarketHaircutStateAccount>>,
 }
@@ -16419,7 +16004,7 @@ fn map_haircut_error(e: matcher::haircut::HaircutError) -> anchor_lang::error::E
 ///   3. On success: record `(now_slot, new_price)` and bump
 ///      `gate_passes`.
 ///
-/// When `envelope_config` is `None`: no-op (legacy behavior).
+/// When `envelope_config` is `None`: no-op (default behavior).
 fn gate_oracle_update<'info>(
     envelope_config: Option<&mut Box<Account<'info, extended_state::MarketEnvelopeConfigAccount>>>,
     new_price_ticks: u64,
@@ -16750,8 +16335,7 @@ pub struct InitFillCommitment<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    // `mut` so the handler can set `fill_commitment_required = true`
-    // (arming the market makes the ring mandatory in apply_fill, sticky).
+    // Mutability is required while the handler initializes the account.
     #[account(
         mut,
         seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
@@ -16778,34 +16362,6 @@ pub struct InitFillCommitment<'info> {
 /// ownership + drained-ring before resizing.
 #[derive(Accounts)]
 pub struct GrowFillCommitment<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-        constraint = market.authority == authority.key() @ CloberError::Unauthorized,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    /// CHECK: PDA we own; reallocated via `AccountInfo::resize` in the handler,
-    /// which re-asserts program ownership before growing. Bound by the seeds.
-    #[account(
-        mut,
-        seeds = [matcher::fill_commitment::FILL_COMMIT_SEED, market.key().as_ref()],
-        bump,
-    )]
-    pub fill_commitment: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-/// Upgrade a market's fill-commitment ring from the
-/// v0 layout to v1 (adds reduce-in-flight tracking). Same authority gate + seed
-/// binding as `GrowFillCommitment`; the ring is reallocated in the handler so it is
-/// an `UncheckedAccount`. MUST run on the base layer with the ring UNdelegated.
-#[derive(Accounts)]
-pub struct UpgradeFillCommitment<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
@@ -17275,43 +16831,6 @@ pub struct InitializeLiquidityPool<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// One-time legacy-seed migration (see `close_legacy_lp_accounts`).
-#[derive(Accounts)]
-pub struct CloseLegacyLpAccounts<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// Admin-gated exactly like `initialize_liquidity_pool`: only the
-    /// insurance-fund authority may run the migration.
-    #[account(
-        seeds = [InsuranceFundAccount::SEED],
-        bump = insurance_fund.bump,
-        constraint = insurance_fund.authority == authority.key() @ CloberError::Unauthorized,
-    )]
-    pub insurance_fund: Account<'info, InsuranceFundAccount>,
-
-    /// CHECK: canonical pool-singleton PDA, REQUIRED UNINITIALIZED — the
-    /// handler gates on it (seeds pin the address; owner/data checked there).
-    #[account(seeds = [LiquidityPoolAccount::SEED], bump)]
-    pub lp_exposure: UncheckedAccount<'info>,
-
-    /// The stranded pre-rename treasury endowment; rent refunds to the
-    /// authority. Typed, so discriminator + seeds bind it to a real
-    /// `LpPositionAccount` owned by this program.
-    #[account(
-        mut,
-        close = authority,
-        seeds = [state::LpPositionAccount::SEED, authority.key().as_ref()],
-        bump = legacy_treasury_position.bump,
-    )]
-    pub legacy_treasury_position: Box<Account<'info, state::LpPositionAccount>>,
-
-    /// CHECK: orphaned pre-rename singleton at the retired `flp_exposure`
-    /// PDA; seeds pin the address, the handler checks program ownership.
-    #[account(mut, seeds = [b"flp_exposure"], bump)]
-    pub legacy_flp_exposure: UncheckedAccount<'info>,
-}
-
 #[derive(Accounts)]
 pub struct LpDeposit<'info> {
     #[account(mut)]
@@ -17335,7 +16854,7 @@ pub struct LpDeposit<'info> {
     pub lp_position: Box<Account<'info, state::LpPositionAccount>>,
 
     /// Protocol-wide LP-system lock. Created on the first LP-share mint of
-    /// either system; the singleton and the per-market v3 pool are then mutually
+    /// either system; the singleton and the per-market per-market pool are then mutually
     /// exclusive on minting shares (they redeem from one vault).
     #[account(
         init_if_needed,
@@ -17667,7 +17186,7 @@ pub struct OpenTraderState<'info> {
 
 /// Sub-account creation. The sub PDA extends the main
 /// seed with a `sub_index` byte; sub_index = 0 is reserved for the
-/// main account (which uses the legacy `OpenTraderState` ix), so this
+/// main account (which uses the default `OpenTraderState` ix), so this
 /// ix accepts sub_index in 1..=255.
 #[derive(Accounts)]
 #[instruction(sub_index: u8)]
@@ -18842,60 +18361,6 @@ pub struct ErMarginAttestedEvent {
 /// Shared Accounts context for `set_position_isolated` and
 /// `set_position_cross`. Both ixs transfer collateral between the
 /// trader's pooled `TraderStateAccount.collateral_quote_lots` and the
-/// Position PDA migration — move a Position from the LEGACY PDA
-/// `[POS_SEED, market, wallet]` to the canonical PDA
-/// `[POS_SEED, market, trader_state.key()]`. The trader signs to
-/// receive the rent refund on the closed legacy account. The new
-/// account is `init`'d (it must not pre-exist) so this ix is a
-/// one-shot per (wallet, market). Failure to land leaves both PDAs in
-/// a clean state for retry.
-#[derive(Accounts)]
-pub struct MigratePositionToTraderStateKey<'info> {
-    #[account(mut)]
-    pub trader: Signer<'info>,
-
-    #[account(
-        seeds = [MarketAccount::SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
-    )]
-    pub market: Box<Account<'info, MarketAccount>>,
-
-    #[account(
-        seeds = [TraderStateAccount::SEED, trader.key().as_ref()],
-        bump = trader_state.load()?.bump,
-        constraint = trader_state.load()?.trader == trader.key() @ CloberError::WrongTrader,
-    )]
-    pub trader_state: AccountLoader<'info, TraderStateAccount>,
-
-    /// LEGACY position at `[POS_SEED, market, wallet]`. Closed by this
-    /// ix; rent refunded to `trader`.
-    #[account(
-        mut,
-        close = trader,
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader.key().as_ref()],
-        bump = legacy_position.load()?.bump,
-    )]
-    pub legacy_position: AccountLoader<'info, state::PositionAccount>,
-
-    /// NEW position at the canonical trader-state-keyed PDA. `init` (not
-    /// init_if_needed) so
-    /// migration can only run when the new slot is empty — protects
-    /// against accidental double-migration overwriting state.
-    #[account(
-        init,
-        payer = trader,
-        space = state::PositionAccount::space(),
-        seeds = [state::PositionAccount::SEED, market.key().as_ref(), trader_state.key().as_ref()],
-        bump,
-    )]
-    pub new_position: AccountLoader<'info, state::PositionAccount>,
-
-    pub system_program: Program<'info, System>,
-}
-
-/// Shared Accounts context for `set_position_isolated` and
-/// `set_position_cross`. Both ixs transfer collateral between the
-/// trader's pooled `TraderStateAccount.collateral_quote_lots` and the
 /// target position's `PositionAccount.collateral_quote_lots`, gated by
 /// a post-transfer health check on every other position the trader
 /// owns (passed via remaining_accounts).
@@ -19595,17 +19060,6 @@ pub struct FillCommitmentGrownEvent {
     pub new_bytes: u32,
 }
 
-/// Emitted when a market's fill-commitment ring is
-/// upgraded from the v0 layout to v1 (adds reduce-in-flight tracking).
-#[event]
-pub struct FillCommitmentUpgradedV1Event {
-    pub market: Pubkey,
-    pub fill_commitment: Pubkey,
-    pub cap: u32,
-    pub old_bytes: u32,
-    pub new_bytes: u32,
-}
-
 /// Emitted when `reconcile_unsettled_fill_volume` resets a
 /// drifted counter to 0 on a drained ring. `previous_unsettled` records the
 /// drift that was cleared (0 if it was already correct).
@@ -19732,7 +19186,7 @@ pub struct MarketDelegatedEvent {
 }
 
 #[event]
-pub struct OrderPlacedV2Event {
+pub struct OrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub seq: u64,
@@ -19826,7 +19280,7 @@ pub struct FillBatchOutboxEvent {
 
 /// How many price levels per side `view_book_depth` returns.
 /// Capped to keep the event log payload bounded; off-chain depth
-/// reconstruction watches `OrderPlacedV2Event` + `OrderCancelledV2Event`
+/// reconstruction watches `OrderPlacedEvent` + `OrderCancelledEvent`
 /// for the long tail.
 pub const BOOK_DEPTH_LEVELS: usize = 4;
 
@@ -19857,7 +19311,7 @@ pub const BOOK_DEPTH_LEVELS: usize = 4;
 /// Deeper crossings truncate GRACEFULLY at the cap (the `walk_limit` path drops
 /// the residual) instead of OOM-panicking. The fill-commitment ring cap (256)
 /// stays ≥ this, as the intake margin gate requires.
-pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 96;
+pub const MAX_MATCH_BATCH_ORDERS: usize = 96;
 
 /// Withdrawal floor. When a trader pulls collateral from
 /// `partial_withdraw_collateral` with positions still open, the remaining
@@ -19869,7 +19323,7 @@ pub const MAX_BATCH_ORDERS_PER_SIDE_V2: usize = 96;
 pub const WITHDRAWAL_FLOOR_BPS: u32 = 1000;
 
 #[event]
-pub struct OrderCancelledV2Event {
+pub struct OrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub order_seq: u64,
@@ -19909,18 +19363,6 @@ pub struct SubAccountTransferEvent {
     pub sub_balance_after: u64,
 }
 
-/// Emitted by `migrate_position_to_trader_state_key`. Carries the
-/// position's pre-migration core state for off-chain audit; indexers
-/// re-key from the legacy `[POS_SEED, market, wallet]` PDA to the
-/// new `[POS_SEED, market, trader_state]` PDA after this event lands.
-#[event]
-pub struct PositionMigratedEvent {
-    pub trader: Pubkey,
-    pub market: Pubkey,
-    pub size_lots: u64,
-    pub collateral_quote_lots: u64,
-}
-
 /// Emitted by `set_position_isolated` and `set_position_cross`.
 /// `mode`: 0 = cross, 1 = isolated. The two collateral fields show the
 /// post-transition state for the trader's pooled vs per-position pools.
@@ -19935,9 +19377,9 @@ pub struct PositionMarginModeChangedEvent {
 
 /// Emitted by `cancel_all`. `cancelled_count` is 0 when the trader had
 /// no resting orders (the ix is silently a no-op in that case — useful as
-/// defensive cleanup from a bot). Bounded by `MAX_CANCELS_PER_IX_V2`.
+/// defensive cleanup from a bot). Bounded by `MAX_CANCELLATIONS_PER_INSTRUCTION`.
 #[event]
-pub struct BulkOrderCancelledV2Event {
+pub struct BulkOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub cancelled_count: u32,
@@ -19949,7 +19391,7 @@ pub struct BulkOrderCancelledV2Event {
 /// consumers track open orders by this id (the old id is dead the moment
 /// `cancel` lands inside the ix; no one should reference it again).
 #[event]
-pub struct OrderModifiedV2Event {
+pub struct OrderModifiedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub side: u8,
@@ -19965,7 +19407,7 @@ pub struct OrderModifiedV2Event {
 /// a single ix. Bounded by the BPF compute budget — at 24 cancels the
 /// worst-case (24 removes × ~500 CU each + 100-node walk) lands at
 /// ~14K CU, well inside the 200K default.
-pub const MAX_CANCELS_PER_IX_V2: usize = 24;
+pub const MAX_CANCELLATIONS_PER_INSTRUCTION: usize = 24;
 
 #[derive(Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct BookLevel {
@@ -19976,7 +19418,7 @@ pub struct BookLevel {
 }
 
 #[event]
-pub struct BookDepthV2Event {
+pub struct BookDepthEvent {
     pub market: Pubkey,
     pub total_orders_active: u32,
     pub bids: Vec<BookLevel>,
@@ -20033,12 +19475,6 @@ pub struct LiquidityPoolInitializedEvent {
 }
 
 #[event]
-pub struct LegacyLpAccountsClosedEvent {
-    pub authority: Pubkey,
-    pub reclaimed_lamports: u64,
-}
-
-#[event]
 pub struct LpCapitalUpdatedEvent {
     pub new_total: u64,
     pub delta: i64,
@@ -20087,7 +19523,7 @@ pub struct PositionHaircutInitializedEvent {
 /// `set_market_stress_tier` calibrated a market's per-asset stress tier and
 /// backstop tail. `worst_gap_loss` is the fund draw the tier is proven to be
 /// covered against (`OI_cap × max(0, tail − MM) / BPS`); `0` shocks/tail = the
-/// legacy ±30% off-switch.
+/// default ±30% off-switch.
 #[event]
 pub struct MarketStressTierSetEvent {
     pub market: Pubkey,
@@ -20432,7 +19868,7 @@ pub struct LpQuotesRefreshedEvent {
 }
 
 #[event]
-pub struct LiquidationInjectedV2Event {
+pub struct LiquidationInjectedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub side: u8,
@@ -20491,7 +19927,7 @@ pub struct FundingCrankedEvent {
 }
 
 #[event]
-pub struct BasketOrderPlacedV2Event {
+pub struct BasketOrderPlacedEvent {
     pub trader: Pubkey,
     pub market_a: Pubkey,
     pub market_b: Pubkey,
@@ -20506,7 +19942,7 @@ pub struct BasketOrderPlacedV2Event {
 }
 
 #[event]
-pub struct BasketOrderNPlacedV2Event {
+pub struct BasketOrderNPlacedEvent {
     pub trader: Pubkey,
     pub leg_count: u8,
     pub markets: Vec<Pubkey>,
@@ -20851,7 +20287,7 @@ pub struct JitLiquidationFilledEvent {
 #[event]
 pub struct InvariantBreachDetectedEvent {
     pub market: Pubkey,
-    /// Solvency invariant identifier from docs/SAFETY.md (5 = OI balance,
+    /// Solvency invariant identifier from INVARIANTS.md (5 = OI balance,
     /// 4 = vault conservation, etc).
     pub invariant_code: u8,
     pub expected: u64,
@@ -22247,7 +21683,7 @@ fn apply_realized_pnl_direct<'info>(
 ///     collateral directly — losses are senior to capital.
 ///
 /// When `position_haircut` is `None`: identical to
-/// `apply_realized_pnl_direct` v1 (the legacy direct credit/debit path).
+/// `apply_realized_pnl_direct` current (the default direct credit/debit path).
 ///
 /// This is the **opt-in** wire-in: markets without a HaircutState
 /// keep their existing behaviour bit-for-bit. Markets with HaircutState
@@ -22291,7 +21727,7 @@ fn apply_realized_pnl_delta<'info>(
             return Ok((0, 0));
         }
     }
-    // Loss path AND legacy non-haircut gain path both fall through to v1, which
+    // Loss path AND default non-haircut gain path both fall through to current, which
     // returns (uncovered cross-loss shortfall, collateral removed).
     apply_realized_pnl_direct(delta, isolated, position, trader_state)
 }
@@ -22404,7 +21840,7 @@ fn stamp_zc_discriminator(ai: &AccountInfo<'_>, disc: &[u8]) -> Result<()> {
 
 /// Locate the per-market FillCommitmentAccount in
 /// `remaining_accounts`, if armed. Truly optional — returns `None` when no
-/// matching account is passed (legacy behaviour). An account qualifies iff it is
+/// matching account is passed (default behaviour). An account qualifies iff it is
 /// owned by THIS program (so only `init_fill_commitment` at the canonical PDA
 /// could have created it) AND its disc + market binding + length check out
 /// (`buffer_check`). That pair uniquely identifies the real account without a
@@ -22534,7 +21970,7 @@ fn hash_params(p: &MarketParams) -> Result<[u8; 32]> {
 #[inline]
 fn hip3_core_bounds_ok(max_leverage: u32, mm_bps: u32, im_bps: u32, worst_shock_bps: u32) -> bool {
     use constants::*;
-    // Maintenance floor (decision A): a LEGACY, un-tiered market (worst_shock == 0)
+    // Maintenance floor (decision A): a DEFAULT, un-tiered market (worst_shock == 0)
     // keeps the flat 5% floor. A TIERED market ties its maintenance floor to its
     // calibrated stress shock — mm ≥ max(shock, MIN_MM_ABS). Combined with
     // im ≥ mm this gives im ≥ mm ≥ shock (theorem T2), so a position is
@@ -22566,7 +22002,7 @@ fn validate_hip3_params(p: &MarketParams) -> Result<()> {
             p.max_leverage,
             p.maintenance_margin_ratio_bps,
             p.initial_margin_ratio_bps,
-            // Creation is un-tiered (stress_shock_bps defaults to 0 ⇒ legacy 5%
+            // Creation is un-tiered (stress_shock_bps defaults to 0 ⇒ default 5%
             // MM floor). A calibrated tier is opted into later via
             // set_market_stress_tier, which re-checks these bounds for the new shock.
             0,
@@ -22822,13 +22258,13 @@ fn lp_slot_unrealized_pnl(
         .saturating_mul(sign)
 }
 
-/// Mark a v3 per-market LP pool's open inventory to the market's fresh L1
+/// Mark a native per-market LP pool's open inventory to the market's fresh L1
 /// oracle, returning the signed unrealized PnL in quote lots (0 when flat).
 /// Fails closed (`OracleTooStale`) when the pool holds inventory but the oracle
 /// is missing/stale, so deposit and withdraw can never price shares off a
 /// degraded mark. Uses the L1 oracle, not the ER mark, so it is
 /// ER-stall-independent — identical to the singleton pool's marking.
-fn lp_v3_inventory_mtm(
+fn lp_market_inventory_mtm(
     side: u8,
     size_lots: u64,
     entry_ticks: u64,
@@ -23204,15 +22640,15 @@ fn assert_open_position_budget(open_positions: u8, pos: Option<(u8, u64)>) -> Re
 }
 
 /// the shared intake gate every
-/// maker-OPEN path must pass before resting an order — factored out so the v3
+/// maker-OPEN path must pass before resting an order — factored out so the native
 /// injection handlers (trigger/twap/iceberg/bracket) and `vault_place_order`
-/// gate IDENTICALLY to `place_limit_v2_core` / `place_taker_order`. Settlement
+/// gate IDENTICALLY to `place_limit_core` / `place_taker_order`. Settlement
 /// cannot re-check margin, so a resting order that OPENS exposure must be backed
 /// here, or its later fill opens an under-margined position whose loss socializes
 /// to insurance. Reduce-only orders are EXEMPT (the maker clamp caps them to
 /// reducible size). `pos` = the trader's current (side, size) on this market, or
 /// `None` if flat/unavailable (treated as a full open — strictest, matching the
-/// canonical `place_limit_v2_core` `Option<position>` semantics). Wired into all 6
+/// canonical `place_limit_core` `Option<position>` semantics). Wired into all 6
 /// maker-open paths via `gate_injection_open` (below).
 #[allow(clippy::too_many_arguments)]
 fn assert_injection_intake(
@@ -23245,7 +22681,7 @@ fn assert_injection_intake(
 /// Wiring helper: extract `(pos_info, backing)` from an optional PDA-verified
 /// position + the trader_state (isolated collateral if the position carries it,
 /// else the cross pool), then run `assert_injection_intake`. Mirrors the
-/// `place_limit_v2_core` intake block so every v3 maker-open path gates
+/// `place_limit_core` intake block so every native maker-open path gates
 /// identically. `position == None` ⇒ full-open (strictest), matching the
 /// canonical `Option<position>` semantics.
 #[allow(clippy::too_many_arguments)]
@@ -23717,7 +23153,7 @@ mod realized_pnl_routing_tests {
     // market with tick_size>1 mis-scaled settled collateral by 1/tick_size. No
     // prior test covered tick_size>1 (all fixtures pin 1), which is why it shipped.
     #[test]
-    fn realized_pnl_scales_with_tick_size_h1() {
+    fn realized_pnl_scales_with_tick_size() {
         let zeroed = <state::PositionAccount as bytemuck::Zeroable>::zeroed();
 
         // Long 10 lots @ entry 100, closed by an opposite fill @ 130, tick_size 50.
@@ -23731,7 +23167,7 @@ mod realized_pnl_routing_tests {
         apply_fill_to_position(&mut pos, Side::Short, 10, 130, 0, 50).unwrap();
         assert_eq!(pos.realized_pnl_quote_lots, 15_000);
 
-        // tick_size = 1 reproduces the legacy value (proves no double-count).
+        // tick_size = 1 reproduces the default value (proves no double-count).
         let mut p1 = state::PositionAccount {
             side: 0,
             size_lots: 10,
@@ -24083,29 +23519,6 @@ pub struct CancelJitLiquidationOffer<'info> {
         bump = jit_offer.bump,
     )]
     pub jit_offer: Account<'info, extended_state::JitLiquidationOfferAccount>,
-}
-
-#[derive(Accounts)]
-pub struct MigrateMarketLayout<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// CHECK: layout is the OLD legacy layout; we deserialize via try_deserialize_unchecked
-    /// and gate by `authority == market.authority` inside the handler.
-    /// Owner-checked: must be owned by this program (the discriminator check
-    /// inside the handler validates it's actually a Market account).
-    #[account(mut, owner = crate::ID)]
-    pub market: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[event]
-pub struct MarketMigratedToV3Event {
-    pub market: Pubkey,
-    pub old_size: u32,
-    pub new_size: u32,
-    pub slot: u64,
 }
 
 #[derive(Accounts)]
@@ -24836,8 +24249,8 @@ pub struct LpMarketDeposit<'info> {
     )]
     pub position: Account<'info, extended_state::LpMarketPositionAccount>,
 
-    /// Protocol-wide LP-system lock (see `lp_deposit`). Claimed for v3
-    /// on the first v3 share mint; rejects if the singleton already holds shares.
+    /// Protocol-wide LP-system lock (see `lp_deposit`). Claimed for native
+    /// on the first native share mint; rejects if the singleton already holds shares.
     #[account(
         init_if_needed,
         payer = lp,
@@ -24930,7 +24343,7 @@ pub struct LpMarketWithdraw<'info> {
 // ─── Events ────────────────────────────────────────────────────────────
 
 #[event]
-pub struct TriggerOrderV3PlacedEvent {
+pub struct TriggerOrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
@@ -24942,7 +24355,7 @@ pub struct TriggerOrderV3PlacedEvent {
 }
 
 #[event]
-pub struct TriggerOrderV3ExecutedEvent {
+pub struct TriggerOrderExecutedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
@@ -24956,7 +24369,7 @@ pub struct TriggerOrderV3ExecutedEvent {
 /// past the trader's acceptable_price slippage cap. The trigger
 /// deactivates rather than filling at a much worse price than intended.
 #[event]
-pub struct TriggerOrderV3SlippageCancelledEvent {
+pub struct TriggerOrderSlippageCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
@@ -24965,14 +24378,14 @@ pub struct TriggerOrderV3SlippageCancelledEvent {
 }
 
 #[event]
-pub struct TriggerOrderV3CancelledEvent {
+pub struct TriggerOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub trigger_id: u8,
 }
 
 #[event]
-pub struct TwapOrderV3PlacedEvent {
+pub struct TwapOrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub twap_id: u8,
@@ -24984,7 +24397,7 @@ pub struct TwapOrderV3PlacedEvent {
 }
 
 #[event]
-pub struct TwapSliceV3ExecutedEvent {
+pub struct TwapSliceExecutedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub twap_id: u8,
@@ -24999,7 +24412,7 @@ pub struct TwapSliceV3ExecutedEvent {
 /// cap is breached. The slice is skipped; the TWAP stays active for
 /// future intervals.
 #[event]
-pub struct TwapSliceV3SlippageSkippedEvent {
+pub struct TwapSliceSlippageSkippedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub twap_id: u8,
@@ -25008,7 +24421,7 @@ pub struct TwapSliceV3SlippageSkippedEvent {
 }
 
 #[event]
-pub struct TwapOrderV3CancelledEvent {
+pub struct TwapOrderCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub twap_id: u8,
@@ -25016,7 +24429,7 @@ pub struct TwapOrderV3CancelledEvent {
 }
 
 #[event]
-pub struct IcebergOrderV3PlacedEvent {
+pub struct IcebergOrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub iceberg_id: u8,
@@ -25028,7 +24441,7 @@ pub struct IcebergOrderV3PlacedEvent {
 }
 
 #[event]
-pub struct IcebergV3ReplenishedEvent {
+pub struct IcebergReplenishedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub iceberg_id: u8,
@@ -25038,7 +24451,7 @@ pub struct IcebergV3ReplenishedEvent {
 }
 
 #[event]
-pub struct IcebergV3CancelledEvent {
+pub struct IcebergCancelledEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub iceberg_id: u8,
@@ -25046,7 +24459,7 @@ pub struct IcebergV3CancelledEvent {
 }
 
 #[event]
-pub struct BracketOrderV3PlacedEvent {
+pub struct BracketOrderPlacedEvent {
     pub market: Pubkey,
     pub trader: Pubkey,
     pub parent_side: u8,
@@ -25059,7 +24472,7 @@ pub struct BracketOrderV3PlacedEvent {
 }
 
 #[event]
-pub struct VaultV3CreatedEvent {
+pub struct VaultCreatedEvent {
     pub vault: Pubkey,
     pub strategist: Pubkey,
     pub vault_id: u8,
@@ -25067,13 +24480,13 @@ pub struct VaultV3CreatedEvent {
 }
 
 #[event]
-pub struct VaultTraderStateOpenedV3Event {
+pub struct VaultTraderStateOpenedEvent {
     pub vault: Pubkey,
     pub vault_trader_state: Pubkey,
 }
 
 #[event]
-pub struct VaultDepositV3Event {
+pub struct VaultDepositEvent {
     pub vault: Pubkey,
     pub depositor: Pubkey,
     pub amount_quote_lots: u64,
@@ -25082,7 +24495,7 @@ pub struct VaultDepositV3Event {
 }
 
 #[event]
-pub struct VaultWithdrawV3Event {
+pub struct VaultWithdrawEvent {
     pub vault: Pubkey,
     pub depositor: Pubkey,
     pub shares_burned: u64,
@@ -25091,7 +24504,7 @@ pub struct VaultWithdrawV3Event {
 }
 
 #[event]
-pub struct VaultOrderPlacedV3Event {
+pub struct VaultOrderPlacedEvent {
     pub vault: Pubkey,
     pub market: Pubkey,
     pub side: u8,
@@ -25102,7 +24515,7 @@ pub struct VaultOrderPlacedV3Event {
 }
 
 #[event]
-pub struct VaultOrderCancelledV3Event {
+pub struct VaultOrderCancelledEvent {
     pub vault: Pubkey,
     pub market: Pubkey,
     pub side: u8,
@@ -25112,7 +24525,7 @@ pub struct VaultOrderCancelledV3Event {
 }
 
 #[event]
-pub struct VaultPerfFeeSettledV3Event {
+pub struct VaultPerfFeeSettledEvent {
     pub vault: Pubkey,
     pub strategist: Pubkey,
     pub shares_minted: u64,
@@ -25280,7 +24693,7 @@ mod hip3_kani_proofs {
         let max_lev: u32 = kani::any();
         let mm: u32 = kani::any();
         let im: u32 = kani::any();
-        // Legacy (un-tiered) envelope: flat 5% maintenance floor, unchanged.
+        // Default (un-tiered) envelope: flat 5% maintenance floor, unchanged.
         if hip3_core_bounds_ok(max_lev, mm, im, 0) {
             assert!((1..=HIP3_MAX_LEVERAGE).contains(&max_lev));
             assert!(mm >= HIP3_MIN_MAINTENANCE_MARGIN_BPS);

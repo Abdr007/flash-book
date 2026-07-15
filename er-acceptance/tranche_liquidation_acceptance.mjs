@@ -6,7 +6,7 @@
 // Flow: armed market (max_liq_tranche_lots=2) -> maker rests an ask -> taker
 // BUYS 3 (long @ 100000, healthy) -> set_envelope_config -> update_oracle drops
 // the oracle (first envelope observation seeds+skips the cap) so the long goes
-// underwater -> liquidate_position_v2 -> assert LiquidationInjectedV2Event's
+// underwater -> liquidate_position -> assert LiquidationInjectedEvent's
 // size_lots == 2 (the tranche cap), not 3.
 import fs from "fs";
 import os from "os";
@@ -16,7 +16,7 @@ const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 const FRESH = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD");
-const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
+const OLD = new PublicKey("8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (s) => `https://explorer.solana.com/tx/${s}?cluster=devnet`;
 const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
@@ -87,8 +87,8 @@ console.log(`maker ${maker.publicKey.toBase58().slice(0, 8)}… taker ${taker.pu
 
 // open: maker rests ask @100000 size 3; taker buys 3 -> long 3 @100000
 const MPOS = pda(["position", M, MTS]), TPOS = pda(["position", M, TTS]);
-await send(await program.methods.placeLimitOrderV2(1, new BN(SIZE), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: MTS, position: null }).instruction(), [maker]);
-await send(await program.methods.placeTakerOrderV2(0, new BN(SIZE), new BN(200000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
+await send(await program.methods.placeLimitOrder(1, new BN(SIZE), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: MTS, position: null }).instruction(), [maker]);
+await send(await program.methods.placeTakerOrder(0, new BN(SIZE), new BN(200000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
 await send(await program.methods.applyFill(new BN(SIZE), new BN(100000), 0, false, 0, 0, new BN(1)).accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TTS, makerTraderState: MTS, takerPosition: TPOS, makerPosition: MPOS, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, makerPositionHaircut: null, systemProgram: sys }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction(), [], 1_000_000);
 const tp0 = await program.account.positionAccount.fetch(TPOS);
 console.log(`opened: taker position size=${tp0.sizeLots} side=${tp0.side} (0=long)\n`);
@@ -102,9 +102,9 @@ console.log(`oracle dropped 100000 -> ${DROP}; taker long now underwater\n`);
 
 // liquidate — expect an injected close order of exactly TRANCHE lots
 try {
-  const sig = await send(await program.methods.liquidatePositionV2(new BN(0)).accountsPartial({ caller: liq.publicKey, market: M, marketBook: BOOK, traderState: TTS, callerTraderState: LTS, position: TPOS, systemProgram: sys }).instruction(), [liq], 1_000_000);
+  const sig = await send(await program.methods.liquidatePosition(new BN(0)).accountsPartial({ caller: liq.publicKey, market: M, marketBook: BOOK, traderState: TTS, callerTraderState: LTS, position: TPOS, systemProgram: sys }).instruction(), [liq], 1_000_000);
   const evs = await eventsOf(sig);
-  const inj = evs.find((e) => e.name === "liquidationInjectedV2Event" || e.name === "LiquidationInjectedV2Event");
+  const inj = evs.find((e) => e.name === "liquidationInjectedEvent" || e.name === "LiquidationInjectedEvent");
   const injected = inj ? Number(inj.data.sizeLots) : null;
   rec("4.5 liquidation injects exactly one tranche", injected === TRANCHE, `injected size_lots=${injected} (position was ${SIZE}, tranche=${TRANCHE})`, sig);
 } catch (e) {

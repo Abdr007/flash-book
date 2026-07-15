@@ -279,7 +279,7 @@ pub enum CloberError {
     OracleSourceLocked = 2317,
     #[msg("Pyth publish_time not strictly newer than the last accepted price (replay)")]
     OraclePythReplay = 2318,
-    #[msg("LP system conflict: the other LP accounting system already holds LP shares (singleton and per-market v3 are mutually exclusive)")]
+    #[msg("LP system conflict: the other LP accounting system already holds LP shares (singleton and per-market pools are mutually exclusive)")]
     LpSystemModeConflict = 2321,
     #[msg("Trader has no ER reserved-margin attestation: it must be initialized before trading on a delegated book")]
     ErMarginNotReady = 2322,

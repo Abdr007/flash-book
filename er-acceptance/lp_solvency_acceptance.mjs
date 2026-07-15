@@ -1,9 +1,9 @@
-// LP hardening H-1 LIVE (devnet): on the ring-authenticated path the caller-
+// LP hardening permissionless-solvency LIVE (devnet): on the ring-authenticated path the caller-
 // supplied fill_seq is IGNORED (auto-incremented), so a permissionless keeper
 // CANNOT wedge settlement. Full loop: LP posts → taker crosses → a keeper settles
 // via the ring path with fill_seq = u64::MAX → the fill SETTLES and
 // market.last_settlement_seq becomes 1 (NOT u64::MAX). Market uses a zero taker
-// fee so the taker needs no collateral. L1_RPC=<devnet> node hlp_h1_acceptance.mjs
+// fee so the taker needs no collateral. L1_RPC=<devnet> node lp_solvency_acceptance.mjs
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -35,7 +35,7 @@ const sendAs = async (kp, ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`LP H-1 live acceptance — L1=${L1_RPC}\n`);
+console.log(`LP permissionless-solvency live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const params = ref.params;
@@ -68,7 +68,7 @@ const TPOS = pda(["position", M, TS]);
 console.log(`  market ${M.toBase58()}\n`);
 
 console.log("1) taker crosses the LP ask → a ring commitment is pushed (maker = LP PDA)");
-await sendAs(taker, await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await sendAs(taker, await program.methods.placeTakerOrder(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 
 console.log("2) a KEEPER settles via the ring path with fill_seq = u64::MAX → must SETTLE (seq ignored)");
 const U64MAX = new BN("18446744073709551615");
@@ -84,5 +84,5 @@ console.log("3) verify the nonce AUTO-INCREMENTED to 1 (not wedged at u64::MAX)"
 const mkt = await program.account.marketAccount.fetch(M);
 ok(Number(mkt.lastSettlementSeq) === 1, `last_settlement_seq = ${mkt.lastSettlementSeq} (== 1, not u64::MAX) → market not bricked; DoS closed`);
 
-console.log(`\n${fail === 0 ? "✅ LP H-1 LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ LP permissionless-solvency LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -85,11 +85,11 @@ if (!(await l1.getAccountInfo(TS0))) {
 ok(!!(await l1.getAccountInfo(TS0)), `TraderState(sub 0) exists ${TS0.toBase58().slice(0, 8)}…`);
 
 const takerBuilder = (flags, { position = null } = {}) =>
-  program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), flags, new BN(0), 0)
+  program.methods.placeTakerOrder(0, new BN(1), new BN(100000), flags, new BN(0), 0)
     .accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: TS0, position })
     .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]);
 const limitBuilder = (flags) =>
-  program.methods.placeLimitOrderV2(0, new BN(1), new BN(100000), flags, new BN(0), 0)
+  program.methods.placeLimitOrder(0, new BN(1), new BN(100000), flags, new BN(0), 0)
     .accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: TS0, position: null });
 
 // ── NEG-1: reduce-only taker, no position → ReduceOnlyNoPosition ───────────────

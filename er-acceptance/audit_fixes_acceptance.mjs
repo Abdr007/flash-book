@@ -94,7 +94,7 @@ ok(!!(await l1.getAccountInfo(TS0)), `TraderState(sub 0) exists ${TS0.toBase58()
 
 // Helper: place a taker order, supplying trader_state + (optional) position.
 const placeTaker = (mkt, sub, ts, { position = null, size = 1, price = 100000, side = 0, trader = signer.publicKey } = {}) =>
-  program.methods.placeTakerOrderV2(side, new BN(size), new BN(price), 0, new BN(0), sub)
+  program.methods.placeTakerOrder(side, new BN(size), new BN(price), 0, new BN(0), sub)
     .accountsPartial({ trader, market: mkt.M, marketBook: mkt.BOOK, traderState: ts, position })
     .remainingAccounts([{ pubkey: mkt.FC, isWritable: true, isSigner: false }])
     .instruction();
@@ -129,25 +129,25 @@ ok(Number(ts2info.collateralQuoteLots) === 0, `  precondition: fresh TraderState
 const m2rej = await sendExpectFail(await placeTaker(imM, 0, TS2, { trader: t2.publicKey }), [t2]);
 ok(m2rej, "M-2: zero-collateral open on an initial-margin market is REJECTED (free-option closed)");
 
-// ── F-1 (CRITICAL): vault_place_order_v3 must REQUIRE the vault's TraderState ────
+// ── F-1 (CRITICAL): vault_place_order must REQUIRE the vault's TraderState ────
 // Pre-fix a vault could rest a maker order under (vault_pk,0) with NO TraderState;
 // a taker crossing it committed a fill that could NEVER settle (apply_fill hard-
 // loads the maker TraderState) → permanent FIFO wedge, brickable by any user for
-// rent (create_vault_v3 is permissionless). Post-fix vault_trader_state is a
-// required, PDA-checked account on VaultPlaceOrderV3, so a vault order is
+// rent (create_vault is permissionless). Post-fix vault_trader_state is a
+// required, PDA-checked account on VaultPlaceOrder, so a vault order is
 // structurally unable to rest against a non-existent TraderState.
 console.log("\nF-1: vault order requires the vault's TraderState (anti-wedge, CRITICAL)");
 const vaultId = 1 + Math.floor(Math.random() * 250);
-const vaultPda = pda(["vault_v3", signer.publicKey, Buffer.from([vaultId])]);
-try { await send(await program.methods.createVaultV3(vaultId, Array(32).fill(0), 0).accountsPartial({ strategist: signer.publicKey, vault: vaultPda, systemProgram: sys }).instruction()); } catch (e) {}
+const vaultPda = pda(["vault", signer.publicKey, Buffer.from([vaultId])]);
+try { await send(await program.methods.createVault(vaultId, Array(32).fill(0), 0).accountsPartial({ strategist: signer.publicKey, vault: vaultPda, systemProgram: sys }).instruction()); } catch (e) {}
 ok(!!(await l1.getAccountInfo(vaultPda)), `  vault created ${vaultPda.toBase58().slice(0, 8)}…`);
 const vaultTs = pda(["trader_state", vaultPda]);
 ok(!(await l1.getAccountInfo(vaultTs)), "  precondition: vault TraderState does NOT exist yet");
-const vaultPlace = () => program.methods.vaultPlaceOrderV3(1, new BN(1), new BN(100000), 0, new BN(0))
+const vaultPlace = () => program.methods.vaultPlaceOrder(1, new BN(1), new BN(100000), 0, new BN(0))
   .accountsPartial({ strategist: signer.publicKey, vault: vaultPda, market: im0.M, marketBook: im0.BOOK, vaultTraderState: vaultTs }).instruction();
 const f1neg = await sendExpectFail(await vaultPlace());
 ok(f1neg, "F-1: vault order with a NON-EXISTENT vault TraderState is REJECTED (wedge closed)");
-await send(await program.methods.vaultOpenTraderStateV3().accountsPartial({ strategist: signer.publicKey, vault: vaultPda, vaultTraderState: vaultTs, systemProgram: sys }).instruction());
+await send(await program.methods.vaultOpenTraderState().accountsPartial({ strategist: signer.publicKey, vault: vaultPda, vaultTraderState: vaultTs, systemProgram: sys }).instruction());
 const f1sig = await send(await vaultPlace());
 ok(!!f1sig, `F-1: vault order WITH a real vault TraderState is ACCEPTED — ${String(f1sig).slice(0, 12)}… (no false-reject)`);
 

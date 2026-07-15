@@ -2,7 +2,7 @@
   "endpoint": "https://devnet-as.magicblock.app",
   "validator": "MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57",
   "market": "5siEsRaN8VmLWbtv96Sb79cato5cEY8VaJe4rexTySeg",
-  "method": "client performance.now() around placeTakerOrderV2 send->confirm('confirmed') on the ER; INCLUDES client<->ER network RTT (upper bound on ER execution)",
+  "method": "client performance.now() around placeTakerOrder send->confirm('confirmed') on the ER; INCLUDES client<->ER network RTT (upper bound on ER execution)",
   "samples": 20,
   "warmup": 4,
   "latency_ms": {

@@ -1,11 +1,11 @@
 # Clober
 
-**The machine-proven on-chain orderbook engine built to power [flash.trade](https://flash.trade).**
+**The machine-proven on-chain orderbook engine.**
 
 A continuous central-limit order book for perpetual futures that matches on a
 MagicBlock Ephemeral Rollup and settles on Solana L1, with every fill
 authenticated against an on-chain commitment ring. Currently deployed to
-devnet; not yet live on flash.trade, not yet externally audited.
+devnet; not yet live, not yet externally audited.
 
 ## Spec sheet
 
@@ -15,14 +15,15 @@ devnet; not yet live on flash.trade, not yet externally audited.
 | Place at depth | **13.0–14.1k CU, flat across a 511-level book** (O(log n) insertion) |
 | Taker sweep | **~14.7k CU base + ~1.2k CU per level crossed**, incl. the per-fill keccak settlement commitment; a 96-level sweep clears in one tx (129k CU) in the default 32 KiB heap |
 | Settlement | Two-phase: match on the ER → `apply_fill` on L1 verifies every fill against the keccak commitment ring; a fabricated fill cannot settle |
-| Formal verification | **73 Kani proof harnesses** on the deployed risk/settlement paths + **7 Lean proof modules** (haircut conservation, OI/MMR, funding, per-domain credit, realized-PnL/VWAP, residual conservation, auth completeness) at the real value domain + Certora property specs (written; prover integration in progress) |
+| Formal verification | Kani proof harnesses on deployed risk and settlement paths, plus 7 Lean proof modules for conservation, funding, credit, realized PnL, and authorization completeness |
 | Tests | 621 host/integration tests (the integration suite runs the real compiled `.so` in the BPF VM) + a live MagicBlock devnet ER round-trip acceptance suite |
 | Risk engine | Stress-lattice portfolio margin, worse-of(mark, oracle) liquidation pricing, ADL at true bankruptcy, insurance waterfall, junior-claim profit haircut |
-| Surface | 146 instructions · 137 events · 109 error codes ([IDL](idl/clober.json)) |
-| Program | `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (devnet) |
+| Surface | 162 instructions · 31 accounts · 146 events · 120 typed errors ([IDL](idl/clober.json)) |
+| Program | `8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z` (devnet) |
 
 Reproduce the CU numbers: [docs/SETTLEMENT.md](docs/SETTLEMENT.md). Proof
 inventory: [docs/FORMAL_VERIFICATION.md](docs/FORMAL_VERIFICATION.md).
+The production contract is [INVARIANTS.md](INVARIANTS.md).
 
 ## What this is
 
@@ -61,7 +62,7 @@ integrate the book with minimal work.
   │ trader states · insurance · LP ·    │    │ fill-commitment ring ·       │
   │ governance · oracle configs          │    │ fill outbox                  │
   │                                      │    │                              │
-  │  apply_fill ◀──verify-and-pop─────────────── place_taker_order_v2        │
+  │  apply_fill ◀──verify-and-pop─────────────── place_taker_order        │
   │  (ring-authenticated settlement)     │    │ (matching, ~15k CU)          │
   └──────────────────────────────────────┘    └──────────────────────────────┘
 ```
@@ -77,7 +78,7 @@ vulnerability: [SECURITY.md](SECURITY.md). The single-sequencer trust
 boundary is documented precisely in
 [ER_TRUST_BOUNDARY.md](ER_TRUST_BOUNDARY.md) — it is a bounded, stated
 assumption, not an omission. Operational steps required before mainnet
-(per-market fill-commitment v1 upgrade, multisig authority migration):
+(multisig authority migration):
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Build & test

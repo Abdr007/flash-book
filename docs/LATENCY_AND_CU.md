@@ -1,7 +1,7 @@
 # Latency & Compute-Unit Budget (6.4) — disclosed methodology + measurements
 
 > All figures are from the **deployed devnet program** `BRtnEAZ6…` (bytecode
-> sha256 == the merged-`main` artifact — see `docs/ROADMAP_TO_LAUNCH.md`), read
+> sha256 == the approved release artifact), read
 > from real transactions' `meta.computeUnitsConsumed`. Every row links a real
 > Explorer signature you can independently verify. No synthetic numbers.
 
@@ -16,8 +16,8 @@ never needs a raised compute limit.
 |---|---:|---:|---|
 | `apply_fill` (settlement, incl. 2.3 accrual leg) | **41,342** | 21% | `5T5q3NqW…4XM3` |
 | `claim_fee_accrual` (vault→ATA payout) | **19,375** | 10% | `3RNef6KE…smg` |
-| `liquidate_position_v2` (tranche inject, 4.5) | **52,693** | 26% | `47Rs7892…6A9bS` |
-| `liquidate_position_v2` (OI surcharge on, 4.4) | **55,728** | 28% | `5nrKP3ns…pXkScU` |
+| `liquidate_position` (tranche inject, 4.5) | **52,693** | 26% | `47Rs7892…6A9bS` |
+| `liquidate_position` (OI surcharge on, 4.4) | **55,728** | 28% | `5nrKP3ns…pXkScU` |
 
 Interpretation:
 - **Fills are cheap** — settlement, PnL realization, OI update, fee waterfall,
@@ -48,7 +48,7 @@ notes). MagicBlock's ER targets **sub-50 ms** block execution by design.
 
 A client-observed timed benchmark harness ships in
 `er-acceptance/latency_benchmark.mjs` (methodology documented inline:
-`performance.now()` around `placeTakerOrderV2` send→confirm on the ER
+`performance.now()` around `placeTakerOrder` send→confirm on the ER
 connection, which is an **upper bound** — it includes client↔ER network RTT
 since the measuring client is not co-located with the sequencer). Running it for
 a headline number requires the delegated ER market's oracle/anti-stuffing-band

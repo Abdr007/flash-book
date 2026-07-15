@@ -6,12 +6,12 @@
 
 ## The facts
 
-- The repository is **MIT** (`LICENSE`, "Flash Book contributors").
-- `programs/flash-book/src/hypertree/` is **vendored from Manifest**
+- The repository is **MIT** (`LICENSE`, "Clober contributors").
+- `programs/clober/src/hypertree/` is **vendored from Manifest**
   ([Bonasa-Tech/manifest](https://github.com/Bonasa-Tech/manifest)) and carries
   **GPL-3.0-only** (`LICENSE-HYPERTREE`). This is already disclosed in `README.md`.
 - The hypertree is **compiled and statically linked into the same on-chain
-  program** (`flash-book`) as the first-party code — one `.so`, one address.
+  program** (`clober`) as the first-party code — one `.so`, one address.
 
 ## The legal consequence
 
@@ -20,7 +20,7 @@ other code into a single program (static linking into one binary is the
 canonical "combined work" / "derivative work" case), the GPL's terms attach to
 **the whole combined work upon distribution**:
 
-- **The compiled `flash-book` program (the distributed `.so`) is effectively
+- **The compiled `clober` program (the distributed `.so`) is effectively
   GPL-3.0-only.** You cannot ship the binary under terms more permissive than
   GPL-3.0, because it embeds GPL-3.0 code you don't own the copyright to.
 - **Distribution triggers the source-availability obligation** for the *entire*
@@ -85,7 +85,7 @@ nothing operationally — it only makes the licensing statement precise.
 
 ## The one code action (independent of the decision)
 
-Add a `NOTICE` (or per-file header) recording that `programs/flash-book/src/hypertree/`
+Add a `NOTICE` (or per-file header) recording that `programs/clober/src/hypertree/`
 is a **modified** vendored copy of Manifest's GPL-3.0 hypertree, listing that
 local changes were made (e.g. the `certora`/`kani` cfg gates, `NIL` bound). This
 satisfies GPL-3.0 §5a regardless of which licensing option is chosen.

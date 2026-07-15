@@ -17,7 +17,7 @@ const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 const FRESH = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD");
-const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
+const OLD = new PublicKey("8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (s) => `https://explorer.solana.com/tx/${s}?cluster=devnet`;
 const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
@@ -52,7 +52,7 @@ const mintToIx = (mint, dest, authority, amount) => { const d = Buffer.alloc(9);
 async function injectedInTx(sig) {
   const t = await l1.getTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
   const parser = new anchor.EventParser(FRESH, program.coder);
-  for (const ev of parser.parseLogs(t?.meta?.logMessages || [])) if (/liquidationInjectedV2Event/i.test(ev.name)) return true;
+  for (const ev of parser.parseLogs(t?.meta?.logMessages || [])) if (/liquidationInjectedEvent/i.test(ev.name)) return true;
   return false;
 }
 const rows = [];
@@ -98,15 +98,15 @@ async function scenario(label, slope) {
   }
   const MPOS = pda(["position", M, MTS]), TPOS = pda(["position", M, TTS]);
   // maker asks 10 @ 100000; taker buys 10 -> long 10 @ 100000 (0 PnL, health = DEP)
-  await send(await program.methods.placeLimitOrderV2(1, new BN(SIZE), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: MTS, position: null }).instruction(), [maker]);
-  await send(await program.methods.placeTakerOrderV2(0, new BN(SIZE), new BN(200000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
+  await send(await program.methods.placeLimitOrder(1, new BN(SIZE), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: MTS, position: null }).instruction(), [maker]);
+  await send(await program.methods.placeTakerOrder(0, new BN(SIZE), new BN(200000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   await send(await program.methods.applyFill(new BN(SIZE), new BN(100000), 0, false, 0, 0, new BN(1)).accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TTS, makerTraderState: MTS, takerPosition: TPOS, makerPosition: MPOS, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, makerPositionHaircut: null, systemProgram: sys }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction(), [], 1_000_000);
   // attempt liquidation (no adverse move) — outcome depends ONLY on the surcharge.
-  // A healthy position's liquidate_position_v2 SUCCEEDS but injects nothing; a
-  // liquidatable one injects a close order (LiquidationInjectedV2Event). So key
+  // A healthy position's liquidate_position SUCCEEDS but injects nothing; a
+  // liquidatable one injects a close order (LiquidationInjectedEvent). So key
   // off the event, not tx success.
   try {
-    const sig = await send(await program.methods.liquidatePositionV2(new BN(0)).accountsPartial({ caller: liq.publicKey, market: M, marketBook: BOOK, traderState: TTS, callerTraderState: LTS, position: TPOS, systemProgram: sys }).instruction(), [liq], 1_000_000);
+    const sig = await send(await program.methods.liquidatePosition(new BN(0)).accountsPartial({ caller: liq.publicKey, market: M, marketBook: BOOK, traderState: TTS, callerTraderState: LTS, position: TPOS, systemProgram: sys }).instruction(), [liq], 1_000_000);
     const injected = await injectedInTx(sig);
     return { liquidatable: injected, sig };
   } catch (e) {

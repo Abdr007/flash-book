@@ -17,7 +17,7 @@ const { Program, AnchorProvider, Wallet, BN } = anchor;
 
 const L1_RPC = process.env.L1_RPC || "https://api.devnet.solana.com";
 const FRESH = new PublicKey(process.env.PROGRAM || "BRtnEAZ6Tc61gz8m93unL1vzaC4GjtHViLCU8JqKB2gD");
-const OLD = new PublicKey("5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq");
+const OLD = new PublicKey("8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z");
 const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
 const EXPLORER = (s) => `https://explorer.solana.com/tx/${s}?cluster=devnet`;
 const IDL = JSON.parse(fs.readFileSync(new URL("../idl/clober.json", import.meta.url)));
@@ -85,9 +85,9 @@ const MPOS = pda(["position", M, MTS]), TPOS = pda(["position", M, TTS]);
 let accrued = new BN(0), fillSig;
 try {
   // maker rests a bid: buy 1 @ 90000
-  await send(await program.methods.placeLimitOrderV2(0, new BN(10), new BN(90000), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: MTS, position: null }).instruction(), [maker]);
+  await send(await program.methods.placeLimitOrder(0, new BN(10), new BN(90000), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: MTS, position: null }).instruction(), [maker]);
   // taker sweeps: sell 1 @ 1 (aggressive → crosses the bid; pushes a commitment)
-  await send(await program.methods.placeTakerOrderV2(1, new BN(10), new BN(1), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
+  await send(await program.methods.placeTakerOrder(1, new BN(10), new BN(1), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction(), [taker], 1_400_000);
   // apply_fill settles the committed fill WITH the ring + the referrer accrual
   fillSig = await send(await program.methods.applyFill(new BN(10), new BN(90000), 1, false, 0, 0, new BN(1))
     .accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TTS, makerTraderState: MTS, takerPosition: TPOS, makerPosition: MPOS, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, makerPositionHaircut: null, systemProgram: sys })

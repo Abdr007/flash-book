@@ -7,7 +7,7 @@ but is not observable as a round-trip from a remote client and is not claimed.**
 
 ## Reproduced distribution (dedicated Helius devnet L1 + MagicBlock devnet ER)
 Genesis a fresh cap-105 market, delegate book+ring+outbox to the ER validator
-(`MAS1Dt9…`), fund a fresh maker+taker, then time 20 real `placeTakerOrderV2` fills.
+(`MAS1Dt9…`), fund a fresh maker+taker, then time 20 real `placeTakerOrder` fills.
 
 | metric | value |
 |---|---|

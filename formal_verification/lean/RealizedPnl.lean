@@ -127,7 +127,7 @@ theorem realized_on_reduce (side entry price tick fill size : ℕ) (h : fill ≤
   rw [closed_reduce fill size h]; rfl
 
 /-- MARQUEE — cross-system reconciliation with the notional-return
-formula. V2 settles `(mark − entry)/entry · notional` with
+formula. Clober settles `(mark − entry)/entry · notional` with
 `notional = closed·entry·tick`; multiplying out the division, the clober
 integer PnL satisfies the exact identity
 `pnl · entry = sign · (price − entry) · notional` at UNBOUNDED width — the two

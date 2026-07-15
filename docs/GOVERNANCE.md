@@ -47,7 +47,7 @@ All economic parameter changes (fees, margins, funding, oracle band, LP
 coefficients, …) go through the timelocked path via `PendingParamUpdateAccount`
 (`["pending_params", market]`). **K-3:** the immediate `update_market_params`
 instruction no longer changes economic params — it is restricted to a single
-safety operation, enabling a *disabled* (legacy, pre-bound-era)
+safety operation, enabling a *disabled* pre-bound-era
 oracle-staleness gate (`oracle_staleness_max_seconds == 0` → a sane
 `[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]` value), with every
 other field required byte-identical to the live params. So it cannot change

@@ -5,8 +5,8 @@
 //!
 //! Three flow scenarios:
 //!
-//!  1. Legacy market (haircut state absent): bit-for-bit identical to
-//!     the v1 routing — positive credits to collateral immediately.
+//!  1. baseline market (haircut state absent): bit-for-bit identical to
+//!     the current routing — positive credits to collateral immediately.
 //!  2. Opted-in market with positive gain: pushes into reserve, leaves
 //!     collateral unchanged.
 //!  3. Opted-in market with loss: bypasses haircut entirely, debits
@@ -34,7 +34,7 @@ struct PosHaircut {
 
 /// Mirror of `apply_realized_pnl_delta`. Signature exactly tracks
 /// the on-chain function — `position_haircut: Option<&mut ...>` toggles
-/// between legacy and haircut routing.
+/// between baseline and haircut routing.
 fn dispatch(
     delta: i128,
     isolated: bool,
@@ -63,7 +63,7 @@ fn dispatch(
             return Ok(());
         }
     }
-    // Legacy v1 routing.
+    // baseline current routing.
     if delta > 0 {
         let credit = if delta > u64::MAX as i128 {
             u64::MAX
@@ -96,8 +96,8 @@ fn dispatch(
 // ─── Scenarios ──────────────────────────────────────────────────────
 
 #[test]
-fn legacy_market_gain_credits_collateral_directly() {
-    // No haircut state → v1 behavior. Positive delta credits the
+fn baseline_market_gain_credits_collateral_directly() {
+    // No haircut state → current behavior. Positive delta credits the
     // appropriate bucket immediately.
     let mut b = Buckets {
         iso: 1_000,
@@ -109,7 +109,7 @@ fn legacy_market_gain_credits_collateral_directly() {
 }
 
 #[test]
-fn legacy_market_loss_debits_collateral_directly() {
+fn baseline_market_loss_debits_collateral_directly() {
     let mut b = Buckets {
         iso: 1_000,
         cross: 5_000,
@@ -152,7 +152,7 @@ fn opted_in_market_loss_still_debits_collateral_directly() {
 
 #[test]
 fn opted_in_market_zero_delta_is_noop_with_or_without_haircut() {
-    // No-op cases identical between legacy and haircut paths.
+    // No-op cases identical between baseline and haircut paths.
     let mut b1 = Buckets {
         iso: 1_000,
         cross: 5_000,
@@ -225,8 +225,8 @@ fn cross_isolated_routing_under_opted_in_is_orthogonal_to_haircut() {
 }
 
 #[test]
-fn legacy_path_unchanged_under_any_isolated_cross_combination() {
-    // The legacy path must behave bit-for-bit as before. Regression
+fn baseline_path_unchanged_under_any_isolated_cross_combination() {
+    // The baseline path must behave bit-for-bit as before. Regression
     // guard against accidentally diverging the no-haircut path.
     // Isolated + gain
     let mut b = Buckets {

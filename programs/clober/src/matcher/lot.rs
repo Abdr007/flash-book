@@ -89,14 +89,14 @@ pub fn notional_quote_lots(
     price: Ticks,
     tick_size_quote_lots_per_base_lot: u64,
 ) -> Result<QuoteLots> {
-    let m1 = (base.0 as u128)
+    let base_scaled = (base.0 as u128)
         .checked_mul(price.0 as u128)
         .or_overflow()?;
-    let m2 = m1
+    let quote_scaled = base_scaled
         .checked_mul(tick_size_quote_lots_per_base_lot as u128)
         .or_overflow()?;
-    if m2 > u64::MAX as u128 {
+    if quote_scaled > u64::MAX as u128 {
         return Err(error!(CloberError::ArithmeticOverflow));
     }
-    Ok(QuoteLots(m2 as u64))
+    Ok(QuoteLots(quote_scaled as u64))
 }
