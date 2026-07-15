@@ -61,10 +61,12 @@ the code and the documentation tell the same story an external auditor will:
 - **Single-sequencer ordering/liveness.** Fill ordering and matching
   liveness trust the market's configured sequencer. Fund-safety does not:
   settlement authenticity is enforced on L1 by the fill-commitment ring
-  (`apply_fill` verifies every fill), the sequencer cannot route a fill to
-  the wrong account (trader-state PDAs are re-derived at settlement), and a
-  censoring or dead ER can be permissionlessly force-undelegated after a
-  proven-silent timeout. Full statement: `ER_TRUST_BOUNDARY.md` §1.
+  (`apply_fill` verifies every fill), and the sequencer cannot route a fill to
+  the wrong account (trader-state PDAs are re-derived at settlement). The
+  permissionless force-undelegation gate is implemented and proven, but the
+  deployed delegation program has no owner-callable recovery instruction; a
+  censored or dead ER currently requires sequencer cooperation to exit. Full
+  statement: `ER_TRUST_BOUNDARY.md` §1.
 - **Sequencer-attested ER reserved margin (the withdraw-anytime window).**
   Collateral is authoritative on L1 while resting orders live on the ER, so
   the margin a live ER order reserves reaches L1 only through the

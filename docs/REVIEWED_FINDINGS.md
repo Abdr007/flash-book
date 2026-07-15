@@ -9,8 +9,8 @@ code stands as-is.
 
 - **Withdraw/sweep health uses the stored mark, not a forced-fresh oracle.**
   Requiring a fresh oracle and failing closed on a stale mark would block
-  withdrawals during an ER stall — directly against the trustless exit guarantee
-  (a trader must be able to exit when the ER is dark). The stored mark is already
+  withdrawals during an ER stall, including after the book returns to L1. The
+  stored mark is already
   clamped to the oracle band, and the stress-lattice margin check plus the
   initial-margin buffer bound the residual. Leaving it is the safer choice.
 
