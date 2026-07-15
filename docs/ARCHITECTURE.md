@@ -6,38 +6,39 @@ Rollup (ER); custody, risk, and settlement live on the base layer (L1). The
 program surface is 162 instructions, 146 events, and 120 typed errors
 (`idl/clober.json` is the source of truth).
 
-```
-        ┌──────────────── Solana L1 ─────────────────────┐
-        │                                                │
-        │  MarketAccount        · params, mark, OI,      │
-        │                         oracle, status         │
-        │  TraderStateAccount   · collateral, fee tier,  │
-        │                         sub-accounts           │
-        │  PositionAccount      · side, size, entry,     │
-        │                         funding snapshot       │
-        │  LiquidityPoolAccount   · pool capital + NAV     │
-        │  InsuranceFundAccount · waterfall backstop     │
-        │  Vaults native            · strategist vaults      │
-        │  Oracle configs       · Pyth / Lazer bindings  │
-        │  Governance PDAs      · guardian, pending      │
-        │                         transfer/params,       │
-        │                         committee              │
-        │                                                │
-        │  apply_fill / apply_lp_fill  ◄── settlement   │
-        │  (verifies every fill against the ring)        │
-        └───────────────┬────────────────────────────────┘
-                        │ delegate market_book + fill ring + outbox
-                        ▼
-        ┌────────── MagicBlock ER (per market) ──────────┐
-        │                                                │
-        │  MarketBook (hypertree slab; bids + asks)      │
-        │  place/cancel/modify · continuous price-time   │
-        │  place_taker_order · walks the book,        │
-        │    pushes keccak fill commitments to the ring  │
-        │    and full fill records to the outbox         │
-        │  LP auto-quoter ladder                        │
-        │                                                │
-        └────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph l1[Solana L1: custody, risk, and finality]
+        direction TB
+        state[Market, trader, position, pool,<br/>insurance, and governance accounts]
+        oracle[Pyth / Lazer / quorum oracle inputs]
+        guard[Margin, price-band, OI, and<br/>liquidation safety gates]
+        settle[apply_fill / apply_lp_fill<br/>recompute commitment and settle]
+        state --> guard --> settle
+        oracle --> guard
+    end
+
+    subgraph er[Ephemeral Rollup: delegated execution]
+        direction TB
+        book[MarketBook<br/>price-time order book]
+        matcher[Limit, cancel, modify, and taker matching]
+        ring[Fill-commitment ring<br/>FIFO keccak commitments]
+        outbox[Fill outbox<br/>full fill records]
+        quotes[Inventory-aware LP quotes]
+        book <--> matcher
+        quotes --> matcher
+        matcher --> ring
+        matcher --> outbox
+    end
+
+    state -. delegate only book, ring, outbox .-> book
+    ring == committed FIFO proof ==> settle
+    outbox -. settlement record .-> settle
+
+    classDef l1 fill:#052e2b,stroke:#14b8a6,color:#f8fafc,stroke-width:2px;
+    classDef execution fill:#16213b,stroke:#60a5fa,color:#f8fafc,stroke-width:2px;
+    class state,oracle,guard,settle l1;
+    class book,matcher,ring,outbox,quotes execution;
 ```
 
 ## The L1/ER split
@@ -151,16 +152,16 @@ the direct-authority paths on a market, leaving only Pyth/Lazer.
 
 ## ER lifecycle and liveness
 
-Delegation CPIs (`src/er.rs`) stage the account into a buffer, hand
-ownership to the MagicBlock delegation program, and restore it byte-exact
-at undelegation — where the callback binds the DLP's signed buffer to the
-canonical `["undelegate-buffer", delegated]` PDA and re-derives the target
-from its seeds, so a forged buffer cannot materialize state. Liveness is
-two-tier: a fast permissionless force-undelegate opens when the ER shows no
-signal (no fill, no heartbeat) past a stall timeout, and a censorship
-backstop opens on settlement silence alone past a much longer timeout —
-a heartbeating-but-censoring sequencer cannot trap funds, and a
-healthy-but-quiet market cannot be griefed off the ER (Kani-proven gate).
+Delegation CPIs (`src/er.rs`) stage the account into a buffer, hand ownership
+to the MagicBlock delegation program, and restore it byte-exact at
+undelegation. The callback binds the DLP-signed buffer to the canonical
+`["undelegate-buffer", delegated]` PDA and re-derives the target from its
+seeds, so a forged buffer cannot materialize state. The program contains
+Kani-gated force-undelegation and settlement-silence escape paths; however,
+the currently deployed MagicBlock delegation integration still requires a
+sequencer-signed `commit_and_undelegate` for the final platform operation.
+That is an explicit liveness limitation, documented in
+`ER_TRUST_BOUNDARY.md`, and not a claim of a fully permissionless live exit.
 
 ## Privacy (dark pool)
 

@@ -92,7 +92,7 @@ mmr_concentration(s, m) = mmr_m  +  (extra_m  if  s ≥ thresh_m  else  0)
 
 `thresh_m == 0` disables the tier (baseline single-MMR behaviour).
 
-### 2.2 Tiered MMR (Hyperliquid-style)
+### Tiered MMR
 
 If `MarketLeverageTiersAccount` is configured, a position's effective
 MMR is the highest tier whose `min_notional_quote_lots` does not

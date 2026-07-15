@@ -14,7 +14,8 @@
 //     node er-acceptance/er_acceptance.mjs
 //
 // Requires: a funded keypair at ~/.config/solana/id.json that is the market
-// authority, and the program deployed (5VqBgu…) on the target cluster.
+// authority, and the program address declared by the checked-out IDL deployed
+// on the target cluster.
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";

@@ -259,7 +259,7 @@ each property over 2000 random cases.
 
 ## 11. References
 
-- Tarun Chitra, *Autodeleveraging: Impossibilities and Optimization*, arXiv:2512.01112 — motivation for the junior-claim design (Hyperliquid Oct 10 2025 ADL overshoot).
+- Tarun Chitra, *Autodeleveraging: Impossibilities and Optimization*, arXiv:2512.01112 — motivation for the junior-claim design after observed ADL overshoot events.
 - The "realized PnL doesn't materialise to collateral on close" failure mode this primitive structurally resolves (see `docs/MARGIN_MATH.md`).
 
 ## 12. Wire-in (integration contract)

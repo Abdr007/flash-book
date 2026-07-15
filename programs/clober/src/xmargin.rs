@@ -174,8 +174,8 @@ pub fn apply_capped_debit(balance: u64, amount: u64) -> (u64, u64) {
 // call sites.
 //
 // They are DELIBERATELY UNWIRED. A sound + complete on-chain reservation is
-// architecturally precluded (see `docs/REVIEWED_FINDINGS.md`, "G-1"): there is no
-// per-trader live-order anchor to prove completeness, and the removal sites that
+// architecturally precluded: there is no per-trader live-order anchor to prove
+// completeness, and the removal sites that
 // fire without the owner — bulk `reap_expired_orders` and the maker side of a
 // taker walk — cannot carry the owner's `TraderState`, so any accumulator drifts
 // and would permanently over-lock collateral. The residual loss is instead BOUNDED
@@ -1041,8 +1041,8 @@ mod xmargin_kani_proofs {
         assert!(req >= er);
     }
 
-    /// ANTI-SELF-LIQUIDATION (the Hyperliquid self-liquidation attack, blocked by
-    /// construction): NO withdrawal the reserve-margin gate allows can leave the
+    /// Rejects self-liquidation by construction: no withdrawal the reserve-margin
+    /// gate allows can leave the
     /// account below maintenance margin — so a trader can never withdraw
     /// themselves into a liquidatable state and dump the resulting loss onto the
     /// insurance fund. The partial-withdraw gate admits `amount` only if the

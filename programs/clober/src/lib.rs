@@ -2513,13 +2513,6 @@ pub mod clober {
         Ok(())
     }
 
-    // ─── REMOVED: wrapper-program CPI ixs (place_limit_order_v2_cpi,
-    // cpi_release_collateral_to_user, cpi_open_trader_state_for_trader,
-    // cpi_credit_collateral, cpi_debit_collateral, cancel_order_cpi)
-    // were the cross-program CPI gate used by the now-merged wrapper
-    // programs. With monolithic clober the wrapper-authority gate is
-    // gone — ixs operate directly.
-
     /// native cancel: remove a resting order from the hypertree. Validates
     /// that the caller is the original trader (orders carry the trader
     /// pubkey inline). Refunds no SPL tokens — the native book holds no escrow;
@@ -6832,8 +6825,8 @@ pub mod clober {
 
     /// Update oracle price using a multi-oracle quorum (median of 3).
     ///
-    /// Defense in depth against the JELLY/POPCAT class of attacks where an
-    /// attacker manipulates a single upstream price source. With three
+    /// Defense in depth against attacks where an attacker manipulates a single
+    /// upstream price source. With three
     /// independent sources (e.g. Pyth + Switchboard + internal TWAP), an
     /// attacker would have to corrupt the majority simultaneously to move
     /// the median.
@@ -7919,7 +7912,7 @@ pub mod clober {
         Ok(())
     }
 
-    /// 3.1 (percolator per-domain credit): post this market's paper-profit
+    /// Set this market's paper-profit
     /// HAIRCUT — `BPS_DENOM − credit_rate`, where `credit_rate = min(1,
     /// backing/claims)` (`docs/PER_DOMAIN_CREDIT.md`). A keeper computes the
     /// market's ability-to-pay off-chain (winners' claims vs. what the losing

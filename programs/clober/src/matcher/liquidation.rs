@@ -305,8 +305,8 @@ mod health_price_kani_proofs {
         assert!(hp >= oracle);
     }
 
-    /// ANTI-JELLY (the mark-manipulation vector — the $20M Hyperliquid attack).
-    /// That attack pumped a thin-market mark to inflate a position's usable equity.
+    /// Resists mark-manipulation attempts.
+    /// A thin-market mark pump can inflate a position's apparent usable equity.
     /// The health price that feeds margin / loss-cure / withdrawal is the WORSE of
     /// the two real sources, so a mark manipulated IN THE ATTACKER'S FAVOUR (pumped
     /// UP for a long, dumped DOWN for a short) can NEVER move the health price past
@@ -315,7 +315,7 @@ mod health_price_kani_proofs {
     /// (When the mark moves AGAINST the attacker it IS used — that only raises their
     /// risk, never their credit, which is the correct, conservative direction.)
     #[kani::proof]
-    fn jelly_mark_manipulation_yields_no_usable_equity() {
+    fn manipulated_mark_yields_no_usable_equity() {
         let honest_oracle: u64 = kani::any();
         kani::assume(honest_oracle > 0); // the attacked market has a live oracle
         let manipulated_mark: u64 = kani::any();

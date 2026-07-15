@@ -1,13 +1,19 @@
 # Clober
 
-**The machine-proven on-chain orderbook engine.**
+**Verifiable execution for perpetual-futures order books.**
 
-A continuous central-limit order book for perpetual futures that matches on a
-MagicBlock Ephemeral Rollup and settles on Solana L1, with every fill
-authenticated against an on-chain commitment ring. Currently deployed to
-devnet; not yet live, not yet externally audited.
+A continuous central-limit order book for perpetual futures. Clober matches on
+a MagicBlock Ephemeral Rollup and settles on Solana L1; every fill is
+authenticated against an on-chain commitment ring before collateral changes.
 
-## Spec sheet
+| Release posture | Current state |
+|---|---|
+| Network | Devnet deployment; not yet live or externally audited |
+| Program | [`8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z`](https://explorer.solana.com/address/8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z?cluster=devnet) |
+| Interface | [Generated IDL](idl/clober.json), checked against a fresh Anchor build in CI; publication to devnet metadata is release-gated |
+| Production gate | Governance multisig migration and the operational checks in [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+
+## Protocol Surface
 
 | | |
 |---|---|
@@ -19,11 +25,20 @@ devnet; not yet live, not yet externally audited.
 | Tests | 621 host/integration tests (the integration suite runs the real compiled `.so` in the BPF VM) + a live MagicBlock devnet ER round-trip acceptance suite |
 | Risk engine | Stress-lattice portfolio margin, worse-of(mark, oracle) liquidation pricing, ADL at true bankruptcy, insurance waterfall, junior-claim profit haircut |
 | Surface | 162 instructions · 31 accounts · 146 events · 120 typed errors ([IDL](idl/clober.json)) |
-| Program | `8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z` (devnet) |
+| Program | Devnet deployment; on-chain metadata publication follows the approved generated IDL |
 
-Reproduce the CU numbers: [docs/SETTLEMENT.md](docs/SETTLEMENT.md). Proof
-inventory: [docs/FORMAL_VERIFICATION.md](docs/FORMAL_VERIFICATION.md).
-The production contract is [INVARIANTS.md](INVARIANTS.md).
+Compute methodology: [docs/SETTLEMENT.md](docs/SETTLEMENT.md). Proof
+inventory: [docs/FORMAL_VERIFICATION.md](docs/FORMAL_VERIFICATION.md). The
+production contract is [INVARIANTS.md](INVARIANTS.md).
+
+## Navigate
+
+| Need | Reference |
+|---|---|
+| Integrate the program | [IDL](idl/clober.json) and [instruction reference](docs/INSTRUCTIONS.md) |
+| Understand settlement | [architecture](docs/ARCHITECTURE.md) and [settlement design](docs/SETTLEMENT.md) |
+| Review safety properties | [invariants](INVARIANTS.md), [security policy](SECURITY.md), and [trust boundary](ER_TRUST_BOUNDARY.md) |
+| Operate a deployment | [deployment runbook](docs/DEPLOYMENT.md) and [operations guide](docs/OPERATIONS.md) |
 
 ## What this is
 

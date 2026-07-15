@@ -16,7 +16,7 @@ dormant half-wired money code.**
 
 ## The attack it closes
 
-The Hyperliquid-class oracle-pump (ETH whale, JELLY, POPCAT): manipulate a thin
+An oracle-pump attack: manipulate a thin
 or stale market's price so a position shows large *paper* PnL, then use that
 paper PnL as if it were real value — to back margin on another position, cure a
 loss, or withdraw. A single global haircut ratio and a price-scenario lattice

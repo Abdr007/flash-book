@@ -4714,7 +4714,7 @@ async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
 /// commitment (maker = the LP PDA); then a ROGUE keeper (NOT market.sequencer)
 /// settles it via the RING-AUTHENTICATED `apply_lp_fill` path. Asserts the fill
 /// is authentic + permissionless, and the pool takes the opposite side — the
-/// Hyperliquid liquidity pool model, on-chain and trust-minimized.
+/// On-chain, trust-minimized liquidity pool model.
 #[tokio::test]
 async fn liquidity_pool_lp_maker_order_crossed_and_settled_permissionlessly() {
     let pt = make_program_test();

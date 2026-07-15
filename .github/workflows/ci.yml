@@ -167,8 +167,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Validate launch market configuration
-        run: node scripts/validate-market-catalog.mjs
+      - name: Validate release configuration and documentation
+        run: |
+          node scripts/validate-market-catalog.mjs
+          node scripts/validate-markdown.mjs
 
   lean:
     name: Formal verification (Lean)

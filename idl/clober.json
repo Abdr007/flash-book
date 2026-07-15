@@ -13481,7 +13481,7 @@
     {
       "name": "set_paper_profit_haircut",
       "docs": [
-        "3.1 (percolator per-domain credit): post this market's paper-profit",
+        "Set this market's paper-profit",
         "HAIRCUT — `BPS_DENOM − credit_rate`, where `credit_rate = min(1,",
         "backing/claims)` (`docs/PER_DOMAIN_CREDIT.md`). A keeper computes the",
         "market's ability-to-pay off-chain (winners' claims vs. what the losing",
@@ -15582,8 +15582,8 @@
       "docs": [
         "Update oracle price using a multi-oracle quorum (median of 3).",
         "",
-        "Defense in depth against the JELLY/POPCAT class of attacks where an",
-        "attacker manipulates a single upstream price source. With three",
+        "Defense in depth against attacks where an attacker manipulates a single",
+        "upstream price source. With three",
         "independent sources (e.g. Pyth + Switchboard + internal TWAP), an",
         "attacker would have to corrupt the majority simultaneously to move",
         "the median.",
@@ -24246,7 +24246,7 @@
           {
             "name": "paper_profit_haircut_bps",
             "docs": [
-              "3.1 (percolator per-domain credit): the paper-profit HAIRCUT for this",
+              "Paper-profit haircut for this",
               "market, in bps. Usable positive unrealized PnL on this market is scaled by",
               "`(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM`, i.e. this is",
               "`BPS_DENOM − credit_rate`, where `credit_rate = min(1, backing/claims)`",
@@ -25198,8 +25198,7 @@
             "name": "oracle_staleness_max_seconds",
             "docs": [
               "Maximum age (in seconds) for an oracle price before it's rejected",
-              "as stale. Mitigates the JELLY-style attack where attackers wait",
-              "for an oracle gap to manipulate the mark."
+              "as stale. Mitigates oracle-gap attacks that manipulate the mark."
             ],
             "type": "u32"
           },
@@ -25216,7 +25215,7 @@
             "name": "max_position_lots_per_trader",
             "docs": [
               "Per-trader maximum position size on this market, in base lots.",
-              "0 = unlimited. Prevents the POPCAT-style coordinated long buildup",
+              "0 = unlimited. Prevents coordinated long buildup",
               "where a single attacker accumulates outsized concentrated risk."
             ],
             "type": "u64"
@@ -25294,7 +25293,7 @@
           {
             "name": "referrer_share_bps",
             "docs": [
-              "Hyperliquid-style affiliate program: when a taker has a referrer",
+              "Affiliate program: when a taker has a referrer",
               "set on their TraderState, this many bps of the protocol's NET fee",
               "(post-rebate, post-discount) is credited to the referrer's",
               "TraderState collateral. 0 = referral program off. Typical: 1000-",
@@ -25330,7 +25329,7 @@
               "Pre-launch market flag. When true, this market is trading a",
               "pre-TGE asset whose oracle is supplied by `update_oracle` (manual /",
               "quorum) rather than Pyth. Off-chain UIs show a \"PRE-LAUNCH\"",
-              "badge. Hyperliquid pattern: enables price discovery on a perp",
+              "badge. Enables price discovery on a perpetual market",
               "before its spot exists. On-chain semantics are identical to a",
               "regular market — governance is expected to set tighter limits",
               "(lower max_leverage, lower max_position_lots_per_trader) at init."
@@ -25357,7 +25356,7 @@
               "Maximum allowed mark-price change per batch in bps. 0 = unlimited",
               "(pre-launch markets often run open). When set, the",
               "matcher clamps the post-batch mark to ±this fraction of the",
-              "previous mark. Hyperliquid-style anti-flash-crash defense:",
+              "previous mark. Anti-flash-crash defense:",
               "prevents a single thin-liquidity batch (or oracle spike that",
               "passed the band gate) from setting an outlier mark that would",
               "liquidate a swathe of healthy positions on the next assess.",
@@ -26445,7 +26444,7 @@
               "Per-position leverage cap (set by trader via `set_position_leverage`).",
               "0 = use the market's `params.max_leverage`. Otherwise capped at",
               "`min(params.max_leverage, leverage_cap)` during margin checks.",
-              "Hyperliquid pattern: lets risk-conscious traders limit their",
+              "Lets risk-conscious traders limit their",
               "exposure on a per-position basis without affecting other positions.",
               "Validated at set time: cap ∈ [1, market.max_leverage]."
             ],
@@ -27429,7 +27428,7 @@
           {
             "name": "referrer",
             "docs": [
-              "Referrer pubkey (Hyperliquid affiliate model). Set once via",
+              "Referrer pubkey. Set once via",
               "`set_trader_referrer` — immutable after first set."
             ],
             "type": "pubkey"
@@ -27437,7 +27436,7 @@
           {
             "name": "builder",
             "docs": [
-              "Approved builder pubkey (Hyperliquid builder-codes). Set/rotated via",
+              "Approved builder pubkey. Set or rotate via",
               "`set_trader_builder`; the trader's CAP keeps builders bounded."
             ],
             "type": "pubkey"

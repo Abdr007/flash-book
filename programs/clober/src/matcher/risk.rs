@@ -77,7 +77,7 @@ pub struct MarketSnapshot {
     /// Cap on the OI-scaled extra. Default 0 (no cap) = relies on the
     /// natural saturation of u32 bps. Production should set non-zero.
     pub oi_mmr_max_extra_bps: u32,
-    /// 3.1 percolator per-domain credit: paper-profit haircut in bps for THIS
+    /// Paper-profit haircut in bps for this
     /// market. Usable positive unrealized PnL is scaled by
     /// `(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM` — i.e. `BPS_DENOM −
     /// credit_rate`. `0` = no haircut (full paper profit usable, default).

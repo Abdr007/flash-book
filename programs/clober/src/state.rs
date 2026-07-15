@@ -62,8 +62,7 @@ pub struct MarketParams {
     pub batch_interval_ms: u32,
 
     /// Maximum age (in seconds) for an oracle price before it's rejected
-    /// as stale. Mitigates the JELLY-style attack where attackers wait
-    /// for an oracle gap to manipulate the mark.
+    /// as stale. Mitigates oracle-gap attacks that manipulate the mark.
     pub oracle_staleness_max_seconds: u32,
 
     /// Maximum oracle confidence interval as a fraction of price, in bps.
@@ -72,7 +71,7 @@ pub struct MarketParams {
     pub oracle_confidence_max_bps: u32,
 
     /// Per-trader maximum position size on this market, in base lots.
-    /// 0 = unlimited. Prevents the POPCAT-style coordinated long buildup
+    /// 0 = unlimited. Prevents coordinated long buildup
     /// where a single attacker accumulates outsized concentrated risk.
     pub max_position_lots_per_trader: u64,
 
@@ -122,7 +121,7 @@ pub struct MarketParams {
     /// preferentially quote against tagged flow.
     pub jit_bonus_rebate_bps: u32,
 
-    /// Hyperliquid-style affiliate program: when a taker has a referrer
+    /// Affiliate program: when a taker has a referrer
     /// set on their TraderState, this many bps of the protocol's NET fee
     /// (post-rebate, post-discount) is credited to the referrer's
     /// TraderState collateral. 0 = referral program off. Typical: 1000-
@@ -146,7 +145,7 @@ pub struct MarketParams {
     /// Pre-launch market flag. When true, this market is trading a
     /// pre-TGE asset whose oracle is supplied by `update_oracle` (manual /
     /// quorum) rather than Pyth. Off-chain UIs show a "PRE-LAUNCH"
-    /// badge. Hyperliquid pattern: enables price discovery on a perp
+    /// badge. Enables price discovery on a perpetual market
     /// before its spot exists. On-chain semantics are identical to a
     /// regular market — governance is expected to set tighter limits
     /// (lower max_leverage, lower max_position_lots_per_trader) at init.
@@ -165,7 +164,7 @@ pub struct MarketParams {
     /// Maximum allowed mark-price change per batch in bps. 0 = unlimited
     /// (pre-launch markets often run open). When set, the
     /// matcher clamps the post-batch mark to ±this fraction of the
-    /// previous mark. Hyperliquid-style anti-flash-crash defense:
+    /// previous mark. Anti-flash-crash defense:
     /// prevents a single thin-liquidity batch (or oracle spike that
     /// passed the band gate) from setting an outlier mark that would
     /// liquidate a swathe of healthy positions on the next assess.
@@ -449,7 +448,7 @@ pub struct MarketAccount {
     /// seeds the timestamp (no accrual on the first tick), so it can never apply
     /// a rate over an unbounded Δt from an uninitialised clock.
     pub last_funding_crank_unix: u64,
-    /// 3.1 (percolator per-domain credit): the paper-profit HAIRCUT for this
+    /// Paper-profit haircut for this
     /// market, in bps. Usable positive unrealized PnL on this market is scaled by
     /// `(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM`, i.e. this is
     /// `BPS_DENOM − credit_rate`, where `credit_rate = min(1, backing/claims)`
@@ -790,7 +789,7 @@ pub struct PositionAccount {
     /// Per-position leverage cap (set by trader via `set_position_leverage`).
     /// 0 = use the market's `params.max_leverage`. Otherwise capped at
     /// `min(params.max_leverage, leverage_cap)` during margin checks.
-    /// Hyperliquid pattern: lets risk-conscious traders limit their
+    /// Lets risk-conscious traders limit their
     /// exposure on a per-position basis without affecting other positions.
     /// Validated at set time: cap ∈ [1, market.max_leverage].
     pub leverage_cap: u32,
@@ -1072,10 +1071,10 @@ pub struct TraderStateAccount {
     /// portfolio-margin patterns). Cleared via Pubkey::default(). The
     /// trader ALWAYS retains authority — delegate is additive.
     pub delegate: Pubkey,
-    /// Referrer pubkey (Hyperliquid affiliate model). Set once via
+    /// Referrer pubkey. Set once via
     /// `set_trader_referrer` — immutable after first set.
     pub referrer: Pubkey,
-    /// Approved builder pubkey (Hyperliquid builder-codes). Set/rotated via
+    /// Approved builder pubkey. Set or rotate via
     /// `set_trader_builder`; the trader's CAP keeps builders bounded.
     pub builder: Pubkey,
 
