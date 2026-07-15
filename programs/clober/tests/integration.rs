@@ -2123,15 +2123,29 @@ async fn send_capture(
     fee_payer: &Pubkey,
     signers: &[&Keypair],
 ) -> Vec<String> {
-    let bh = ctx.get_new_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(fee_payer), signers, bh);
-    let r = ctx
-        .banks_client
-        .process_transaction_with_metadata(tx)
-        .await
-        .unwrap();
-    r.result.expect("tx ok");
-    r.metadata.expect("metadata present").log_messages
+    // Program-test can return AccountInUse when parallel async tests submit in
+    // the same bank scheduling window. It is transient and the transaction is
+    // not committed, so retrying with a new blockhash is safe and deterministic.
+    for attempt in 1..=6 {
+        let bh = ctx.get_new_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            std::slice::from_ref(&ix),
+            Some(fee_payer),
+            signers,
+            bh,
+        );
+        let r = ctx
+            .banks_client
+            .process_transaction_with_metadata(tx)
+            .await
+            .unwrap();
+        match r.result {
+            Ok(()) => return r.metadata.expect("metadata present").log_messages,
+            Err(solana_sdk::transaction::TransactionError::AccountInUse) if attempt < 6 => {}
+            other => panic!("transaction failed after {attempt} attempt(s): {other:?}"),
+        }
+    }
+    unreachable!("the bounded retry loop either returns or panics")
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ authenticated against an on-chain commitment ring before collateral changes.
 
 | Release posture | Current state |
 |---|---|
-| Network | Devnet deployment; not yet live or externally audited |
+| Network | Live on Solana devnet; not deployed to mainnet and not externally audited |
 | Program | [`8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z`](https://explorer.solana.com/address/8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z?cluster=devnet) |
 | Interface | [Generated IDL](idl/clober.json), checked against a fresh Anchor build in CI and published to the canonical devnet Program Metadata account |
 | Production gate | Governance multisig migration and the operational checks in [docs/OPERATIONS.md](docs/OPERATIONS.md) |
