@@ -336,26 +336,21 @@ pub struct MarketAccount {
     /// Used to enforce `params.mark_settle_min_slots` rate-limit.
     pub last_mark_settle_slot: u64,
     pub params: MarketParams,
-    /// Authorized fill-settlement signer for `apply_fill` / `apply_lp_fill`.
-    ///
-    /// Deliberately decoupled from `authority`: the authority can be burned
-    /// (zeroed) for decentralization, but settlement must keep working — so
-    /// the writer that can post fills is gated by this dedicated,
-    /// separately-rotatable key instead.
+    /// ER operational signer for liveness heartbeats, ER-margin attestations,
+    /// and narrowly scoped keeper actions. Fill settlement is permissionless:
+    /// `apply_fill` and `apply_lp_fill` authenticate each fill against the
+    /// commitment ring instead of trusting this key.
     ///
     /// Set to `authority` at init; rotate via `set_market_sequencer`
     /// (authority-gated, so rotate BEFORE burning authority). Trailing
     /// field: accounts serialized before it existed deserialize it as the
-    /// zero pubkey — which is unsignable, so `apply_fill` fails closed
-    /// (refuses every fill) until the authority sets a sequencer.
+    /// zero pubkey — which is unsignable, so ER heartbeats and attestations fail
+    /// closed until the authority sets an operational signer.
     pub sequencer: Pubkey,
-    /// Monotonic settlement nonce. Every `apply_fill` / `apply_lp_fill`
-    /// must carry a `fill_seq` STRICTLY GREATER than this, after which it is
-    /// stored here — so a replayed or out-of-order settlement (a crashed /
-    /// restarting sequencer re-emitting an already-applied batch, or a
-    /// compromised key resubmitting one) is rejected on-chain. Trailing
-    /// field within `space()` headroom: pre-existing accounts deserialize it
-    /// as 0, so the first real fill (`fill_seq` ≥ 1) passes.
+    /// Gap-free settlement nonce. Every `apply_fill` / `apply_lp_fill` must
+    /// supply exactly `last_settlement_seq + 1`; replays and skipped values fail
+    /// before state mutation. Trailing field within `space()` headroom:
+    /// pre-existing accounts deserialize it as 0, so the first fill uses 1.
     pub last_settlement_seq: u64,
     /// Sticky flag: once `initialize_haircut_state` enables the haircut
     /// junior-claim engine for this market, the (optional) haircut accounts

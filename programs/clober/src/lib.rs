@@ -5439,14 +5439,14 @@ pub mod clober {
         Ok(())
     }
 
-    /// Apply a single fill against the taker's and maker's Position PDAs.
-    /// Called by the off-chain sequencer once per `FillEntry` row in a
-    /// `FillBatchEvent` emitted from `place_taker_order`, or by an
-    /// off-chain bookkeeper that aggregates multiple fills per tx.
+    /// Settle one FIFO fill that the matching engine committed to the market's
+    /// fill-commitment ring. The handler recomputes the Keccak preimage from the
+    /// supplied market, traders, side, size, price, sub-accounts, and JIT flag,
+    /// then consumes the oldest matching commitment before any position changes.
     ///
-    /// Trust model: the `sequencer` signer is the configured authority;
-    /// the fill data is taken at face value (a future version verifies
-    /// via per-tx fill buffer or Merkle proof against the emitted event).
+    /// Settlement is permissionless: the signer pays for execution but does not
+    /// authorize fill economics. A fabricated, altered, redirected, replayed, or
+    /// out-of-order fill fails before collateral or positions can change.
     /// `taker_was_jit`: set to true if the matched taker order was
     /// JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads
     /// this from the order's stored flags. When true, the maker earns
@@ -5480,30 +5480,16 @@ pub mod clober {
         // single sequencer). The `sequencer` account is the fee-paying signer;
         // it need not equal `market.sequencer`.
 
-        // ── Monotonic replay guard ───────────────────────────────
-        // `fill_seq` must STRICTLY exceed the market's settlement nonce. A
-        // replayed / out-of-order settlement — a crashed/restarting sequencer
-        // re-emitting an already-applied batch, or a compromised key
-        // resubmitting one — carries a non-increasing seq and is rejected. The
-        // whole tx reverts on any later error, so advancing the nonce here is
-        // atomic with the fill. Pre-field markets have last_settlement_seq == 0,
-        // so the first real fill (seq ≥ 1) passes. NOTE: this closes the
-        // replay/restart vector; it does NOT defend against a malicious
-        // sequencer FABRICATING a fresh-seq fill — that is the fill-authenticity
-        // commitment (the §3.2 settlement redesign), tracked separately.
-        // P-SETTLE-1: advance the per-market settlement nonce through the
-        // Kani-proven monotonic helper — strictly-increasing `fill_seq` only;
-        // any replay/reorder is rejected (FillSeqReplay) before state mutates.
-        //
-        // The ring provides replay protection and ordering, so a caller-supplied
-        // nonce cannot influence settlement progression.
-        let _ = fill_seq;
-        ctx.accounts.market.last_settlement_seq = ctx
-            .accounts
-            .market
-            .last_settlement_seq
-            .checked_add(1)
-            .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
+        // `fill_seq` is an exact, gap-free settlement sequence. The commitment
+        // ring independently binds the fill contents and FIFO order; this field
+        // makes retries and off-chain reconciliation unambiguous. Requiring the
+        // next value, rather than any larger value, prevents a signer from
+        // skipping ahead and permanently exhausting the nonce.
+        ctx.accounts.market.last_settlement_seq = matcher::fill_commitment::advance_settlement_seq(
+            ctx.accounts.market.last_settlement_seq,
+            fill_seq,
+        )
+        .map_err(|_| error!(CloberError::FillSeqReplay))?;
 
         // Legibility / defense-in-depth: taker and maker MUST be
         // distinct position accounts. A self-fill (same account passed twice) would
@@ -7894,16 +7880,15 @@ pub mod clober {
         Ok(())
     }
 
-    /// Rotate the fill-settlement signer (`market.sequencer`) that
-    /// gates `apply_fill` / `apply_lp_fill`. Authority-gated, so it must
-    /// be done BEFORE `burn_market_authority` (once authority is burned,
-    /// the sequencer is frozen at its last value — which keeps settlement
-    /// running under the decentralised, non-rotatable key).
+    /// Rotate the ER operational signer (`market.sequencer`) used for liveness
+    /// heartbeats, ER-margin attestations, and privileged operational actions.
+    /// Fill settlement remains permissionless because the commitment ring,
+    /// rather than this key, authenticates every settled fill. Authority-gated,
+    /// so rotate before `burn_market_authority`.
     ///
-    /// `new_sequencer` must be non-default; setting it to the zero pubkey
-    /// would brick settlement (the `address = market.sequencer` gate
-    /// becomes unsignable). Use a key you control off-chain to run the
-    /// sequencer process.
+    /// `new_sequencer` must be non-default because a zero key would disable
+    /// authenticated heartbeats and margin attestations. Use a separately scoped
+    /// operational key.
     pub fn set_market_sequencer(
         ctx: Context<UpdateMarketAuthority>,
         new_sequencer: Pubkey,
@@ -9112,13 +9097,11 @@ pub mod clober {
         Ok(())
     }
 
-    /// Apply a fill in which the LP pool is the *maker*. Mutates the
-    /// `LiquidityPoolAccount.per_market` entry for this market while
-    /// applying the opposite-side update to the taker's `PositionAccount`.
-    ///
-    /// Trust model: same as `apply_fill` — sequencer-authenticated; the
-    /// fill data is taken at face value (production verifies via per-batch
-    /// fill buffer or Merkle proof).
+    /// Settle one FIFO commitment in which the LP pool is the maker. The
+    /// commitment binds the taker, LP identity, side, size, price, sub-account,
+    /// and JIT flag before the pool or taker position can change. Any signer may
+    /// submit the transaction; ring authentication, not signer identity,
+    /// authorizes the settlement.
     pub fn apply_lp_fill(
         ctx: Context<ApplyLpFill>,
         size_lots: u64,
@@ -9177,25 +9160,14 @@ pub mod clober {
             })?;
         }
 
-        // ── Monotonic replay guard (see apply_fill) ──────────────
-        // The LP settlement nonce shares the SAME market counter as apply_fill,
-        // so a replay of either path is rejected and the two interleave under a
-        // single strictly-increasing sequence.
-        //
-        // The caller is permissionless, and a caller-controlled `fill_seq` is a
-        // market-freeze DoS — one authentic fill settled with `fill_seq = u64::MAX`
-        // wedges `last_settlement_seq` so every later settlement (`> u64::MAX`)
-        // reverts forever. The ring already provides replay protection (verify-and-
-        // pop, FIFO) and ordering, so the caller's nonce is redundant there:
-        // auto-increment by 1 instead (deterministic, un-grief-able, ignores the
-        // arg).
-        let _ = fill_seq;
-        ctx.accounts.market.last_settlement_seq = ctx
-            .accounts
-            .market
-            .last_settlement_seq
-            .checked_add(1)
-            .ok_or_else(|| error!(CloberError::ArithmeticOverflow))?;
+        // LP and trader settlements share one exact, gap-free sequence. The
+        // commitment ring enforces content and FIFO order; this rejects replayed
+        // and skipped sequence values without allowing a nonce-exhaustion wedge.
+        ctx.accounts.market.last_settlement_seq = matcher::fill_commitment::advance_settlement_seq(
+            ctx.accounts.market.last_settlement_seq,
+            fill_seq,
+        )
+        .map_err(|_| error!(CloberError::FillSeqReplay))?;
         // Honest settlement-liveness signal (see apply_fill): an LP fill is a
         // real settlement, so advance it here too — never via settle_mark.
         ctx.accounts.market.last_settlement_slot = Clock::get()?.slot;

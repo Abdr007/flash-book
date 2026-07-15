@@ -538,8 +538,7 @@ pub struct BatchAttestation {
     pub market: Pubkey,
     pub bump: u8,
     pub _pad0: [u8; 7],
-    /// Strictly-increasing committed batch sequence (replay/reorder guard — the
-    /// batch analog of the per-fill `advance_settlement_seq`).
+    /// Strictly-increasing committed batch sequence (replay/reorder guard).
     pub last_batch_seq: u64,
     /// Committee epoch of the last accepted batch.
     pub epoch: u64,

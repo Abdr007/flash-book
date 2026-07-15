@@ -100,14 +100,14 @@
     {
       "name": "apply_fill",
       "docs": [
-        "Apply a single fill against the taker's and maker's Position PDAs.",
-        "Called by the off-chain sequencer once per `FillEntry` row in a",
-        "`FillBatchEvent` emitted from `place_taker_order`, or by an",
-        "off-chain bookkeeper that aggregates multiple fills per tx.",
+        "Settle one FIFO fill that the matching engine committed to the market's",
+        "fill-commitment ring. The handler recomputes the Keccak preimage from the",
+        "supplied market, traders, side, size, price, sub-accounts, and JIT flag,",
+        "then consumes the oldest matching commitment before any position changes.",
         "",
-        "Trust model: the `sequencer` signer is the configured authority;",
-        "the fill data is taken at face value (a future version verifies",
-        "via per-tx fill buffer or Merkle proof against the emitted event).",
+        "Settlement is permissionless: the signer pays for execution but does not",
+        "authorize fill economics. A fabricated, altered, redirected, replayed, or",
+        "out-of-order fill fails before collateral or positions can change.",
         "`taker_was_jit`: set to true if the matched taker order was",
         "JIT-tagged (flag bit 3 on place_limit_order). The sequencer reads",
         "this from the order's stored flags. When true, the maker earns",
@@ -432,13 +432,11 @@
     {
       "name": "apply_lp_fill",
       "docs": [
-        "Apply a fill in which the LP pool is the *maker*. Mutates the",
-        "`LiquidityPoolAccount.per_market` entry for this market while",
-        "applying the opposite-side update to the taker's `PositionAccount`.",
-        "",
-        "Trust model: same as `apply_fill` — sequencer-authenticated; the",
-        "fill data is taken at face value (production verifies via per-batch",
-        "fill buffer or Merkle proof)."
+        "Settle one FIFO commitment in which the LP pool is the maker. The",
+        "commitment binds the taker, LP identity, side, size, price, sub-account,",
+        "and JIT flag before the pool or taker position can change. Any signer may",
+        "submit the transaction; ring authentication, not signer identity,",
+        "authorizes the settlement."
       ],
       "discriminator": [
         145,
@@ -13089,16 +13087,15 @@
     {
       "name": "set_market_sequencer",
       "docs": [
-        "Rotate the fill-settlement signer (`market.sequencer`) that",
-        "gates `apply_fill` / `apply_lp_fill`. Authority-gated, so it must",
-        "be done BEFORE `burn_market_authority` (once authority is burned,",
-        "the sequencer is frozen at its last value — which keeps settlement",
-        "running under the decentralised, non-rotatable key).",
+        "Rotate the ER operational signer (`market.sequencer`) used for liveness",
+        "heartbeats, ER-margin attestations, and privileged operational actions.",
+        "Fill settlement remains permissionless because the commitment ring,",
+        "rather than this key, authenticates every settled fill. Authority-gated,",
+        "so rotate before `burn_market_authority`.",
         "",
-        "`new_sequencer` must be non-default; setting it to the zero pubkey",
-        "would brick settlement (the `address = market.sequencer` gate",
-        "becomes unsignable). Use a key you control off-chain to run the",
-        "sequencer process."
+        "`new_sequencer` must be non-default because a zero key would disable",
+        "authenticated heartbeats and margin attestations. Use a separately scoped",
+        "operational key."
       ],
       "discriminator": [
         87,
@@ -20971,8 +20968,7 @@
           {
             "name": "last_batch_seq",
             "docs": [
-              "Strictly-increasing committed batch sequence (replay/reorder guard — the",
-              "batch analog of the per-fill `advance_settlement_seq`)."
+              "Strictly-increasing committed batch sequence (replay/reorder guard)."
             ],
             "type": "u64"
           },
@@ -24089,31 +24085,26 @@
           {
             "name": "sequencer",
             "docs": [
-              "Authorized fill-settlement signer for `apply_fill` / `apply_lp_fill`.",
-              "",
-              "Deliberately decoupled from `authority`: the authority can be burned",
-              "(zeroed) for decentralization, but settlement must keep working — so",
-              "the writer that can post fills is gated by this dedicated,",
-              "separately-rotatable key instead.",
+              "ER operational signer for liveness heartbeats, ER-margin attestations,",
+              "and narrowly scoped keeper actions. Fill settlement is permissionless:",
+              "`apply_fill` and `apply_lp_fill` authenticate each fill against the",
+              "commitment ring instead of trusting this key.",
               "",
               "Set to `authority` at init; rotate via `set_market_sequencer`",
               "(authority-gated, so rotate BEFORE burning authority). Trailing",
               "field: accounts serialized before it existed deserialize it as the",
-              "zero pubkey — which is unsignable, so `apply_fill` fails closed",
-              "(refuses every fill) until the authority sets a sequencer."
+              "zero pubkey — which is unsignable, so ER heartbeats and attestations fail",
+              "closed until the authority sets an operational signer."
             ],
             "type": "pubkey"
           },
           {
             "name": "last_settlement_seq",
             "docs": [
-              "Monotonic settlement nonce. Every `apply_fill` / `apply_lp_fill`",
-              "must carry a `fill_seq` STRICTLY GREATER than this, after which it is",
-              "stored here — so a replayed or out-of-order settlement (a crashed /",
-              "restarting sequencer re-emitting an already-applied batch, or a",
-              "compromised key resubmitting one) is rejected on-chain. Trailing",
-              "field within `space()` headroom: pre-existing accounts deserialize it",
-              "as 0, so the first real fill (`fill_seq` ≥ 1) passes."
+              "Gap-free settlement nonce. Every `apply_fill` / `apply_lp_fill` must",
+              "supply exactly `last_settlement_seq + 1`; replays and skipped values fail",
+              "before state mutation. Trailing field within `space()` headroom:",
+              "pre-existing accounts deserialize it as 0, so the first fill uses 1."
             ],
             "type": "u64"
           },

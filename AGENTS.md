@@ -5,13 +5,13 @@ This file is the canonical, machine-readable guide for an autonomous agent (or a
 LLM-driven client) to trade on it. Everything here is derived from the committed
 IDL (`idl/clober.json`) and the on-chain program — no aspirational APIs.
 
-> **Status: pre-deployment release candidate.** Do not use real value until the
-> live deployment gates in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) are complete.
+> **Status: devnet release candidate.** Do not use real value until the
+> production deployment gates in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) are complete.
 > The source-level safety contract is [`INVARIANTS.md`](INVARIANTS.md).
 
 - **Program ID:** `8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z`
 - **Anchor IDL:** [`idl/clober.json`](idl/clober.json) — 162 instructions,
-  31 accounts, 146 events, and 120 typed errors. Load it with
+  31 accounts, 146 events, and 121 typed errors. Load it with
   `@coral-xyz/anchor`'s `Program`.
 - **Machine-readable index:** [`llms.txt`](llms.txt)
 - **Operating constraints:** [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md)

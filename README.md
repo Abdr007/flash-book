@@ -10,7 +10,7 @@ authenticated against an on-chain commitment ring before collateral changes.
 |---|---|
 | Network | Devnet deployment; not yet live or externally audited |
 | Program | [`8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z`](https://explorer.solana.com/address/8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z?cluster=devnet) |
-| Interface | [Generated IDL](idl/clober.json), checked against a fresh Anchor build in CI; publication to devnet metadata is release-gated |
+| Interface | [Generated IDL](idl/clober.json), checked against a fresh Anchor build in CI and published to the canonical devnet Program Metadata account |
 | Production gate | Governance multisig migration and the operational checks in [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 
 ## Protocol Surface
@@ -24,8 +24,8 @@ authenticated against an on-chain commitment ring before collateral changes.
 | Formal verification | Kani proof harnesses on deployed risk and settlement paths, plus 7 Lean proof modules for conservation, funding, credit, realized PnL, and authorization completeness |
 | Tests | 621 host/integration tests (the integration suite runs the real compiled `.so` in the BPF VM) + a live MagicBlock devnet ER round-trip acceptance suite |
 | Risk engine | Stress-lattice portfolio margin, worse-of(mark, oracle) liquidation pricing, ADL at true bankruptcy, insurance waterfall, junior-claim profit haircut |
-| Surface | 162 instructions · 31 accounts · 146 events · 120 typed errors ([IDL](idl/clober.json)) |
-| Program | Devnet deployment; on-chain metadata publication follows the approved generated IDL |
+| Surface | 162 instructions · 31 accounts · 146 events · 121 typed errors ([IDL](idl/clober.json)) |
+| Program | Devnet deployment with canonical on-chain IDL metadata |
 
 Compute methodology: [docs/SETTLEMENT.md](docs/SETTLEMENT.md). Proof
 inventory: [docs/FORMAL_VERIFICATION.md](docs/FORMAL_VERIFICATION.md). The

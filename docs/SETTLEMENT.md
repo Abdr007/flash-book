@@ -44,9 +44,9 @@ matcher's on-chain output:
   that the matcher never produced cannot hash to a committed slot;
   fabrication is rejected (`FillNotCommitted`).
 - **No double-settle, no replay.** The FIFO pop advances `settled`; a slot
-  is consumed exactly once. Independently, `apply_fill` requires a strictly
-  increasing per-market `fill_seq` (`advance_settlement_seq`,
-  machine-proven), making re-submits idempotent.
+  is consumed exactly once. Independently, each settlement must supply the
+  exact next per-market `fill_seq` (`advance_settlement_seq`, machine-proven),
+  so replays and skipped sequence values reject before state mutation.
 - **Ordering.** Settlement order must equal production order — the ring pops
   FIFO.
 - **Backpressure, not overwrite.** Once `produced − settled` reaches the
@@ -255,8 +255,8 @@ produced = u64_le(acct.data[8..16])
 cap      = u32_le(acct.data[24..28])
 for idx in consumed .. produced:              # ascending = FIFO
     slot = decode(acct.data, 64 + (idx % cap) * 96)
-    if slot.maker == Pubkey::default():  apply_lp_fill(slot, fill_seq = idx)
-    else:                                apply_fill(slot,     fill_seq = idx)
+    if slot.maker == Pubkey::default():  apply_lp_fill(slot, fill_seq = idx + 1)
+    else:                                apply_fill(slot,     fill_seq = idx + 1)
     on success: consumed = idx + 1; persist(consumed)
 ```
 
@@ -267,12 +267,12 @@ only), `taker_side @88`, `taker_sub_index @89`, `maker_sub_index @90`,
 (`FBoutbx\0`) and `market` binding before trusting slots, and re-reads `cap`
 each pass (growth keeps absolute indices stable).
 
-**`fill_seq`.** Strictly increasing per market; the absolute fill index is
-the natural gap-free choice and doubles as the dedup key. Settlement order
-must equal production order (FIFO ring).
+**`fill_seq`.** Exactly the next per-market sequence value; with a zero
+initial nonce, `outbox_index + 1` is the natural gap-free choice. Settlement
+order must equal production order (FIFO ring).
 
 **Restart safety.** The account is the durable log: on restart, re-derive
-the cursor and replay `consumed..produced`. The monotonic `fill_seq` guard
+the cursor and replay `consumed..produced`. The gap-free `fill_seq` guard
 plus the ring's consume-and-clear make re-submits idempotent — no lost
 fills, no double settlement.
 

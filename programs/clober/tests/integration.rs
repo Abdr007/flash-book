@@ -4863,14 +4863,13 @@ async fn liquidity_pool_lp_maker_order_crossed_and_settled_permissionlessly() {
     send(
         &mut ctx,
         build_ix(
-            // Pass fill_seq = u64::MAX on the RING path — it must be
-            // IGNORED (auto-incremented), NOT wedge last_settlement_seq. Asserted below.
+            // The first settlement must use the exact next sequence value.
             clober::instruction::ApplyLpFill {
                 size_lots: 1,
                 price_ticks: 100_000,
                 taker_side: 0,
                 taker_sub_index: 0,
-                fill_seq: u64::MAX,
+                fill_seq: 1,
                 taker_was_jit: false,
             },
             vec![
@@ -4906,13 +4905,12 @@ async fn liquidity_pool_lp_maker_order_crossed_and_settled_permissionlessly() {
     assert_eq!(entry.side, 1, "pool short after being crossed as maker");
     assert_eq!(entry.size_lots, 1);
     assert_eq!(entry.entry_price_ticks, 100_000);
-    // The caller-supplied fill_seq (u64::MAX) is IGNORED on the ring path —
-    // the nonce auto-incremented to 1 rather than wedging at u64::MAX. A permissionless
-    // caller cannot brick the market's settlement.
+    // The exact sequence advances to 1 while the commitment ring keeps the
+    // settlement permissionless.
     let mkt: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
         mkt.last_settlement_seq, 1,
-        "ring-path nonce auto-increments; caller fill_seq ignored"
+        "ring-path nonce advances through the exact supplied sequence"
     );
 }
 

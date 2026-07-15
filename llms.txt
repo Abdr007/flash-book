@@ -13,7 +13,7 @@ side 0=long 1=short. sub_index selects a sub-account (0=primary).
 
 - [Agent trading guide](AGENTS.md): the trading lifecycle, instruction signatures, state model, and a minimal client bootstrap.
 - [Production invariants](INVARIANTS.md): the release contract for settlement, custody, risk, oracle, and authority safety.
-- [Anchor IDL](idl/clober.json): the machine source of truth — 162 instructions, 31 accounts, 146 events, 120 typed errors.
+- [Anchor IDL](idl/clober.json): the machine source of truth — 162 instructions, 31 accounts, 146 events, 121 typed errors.
 
 ## Core instructions
 

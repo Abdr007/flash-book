@@ -28,7 +28,7 @@ the Lean proofs on every PR; any broken invariant fails the build.
 | `er` | 2 | The force-undelegate gate only fires when a liveness baseline is genuinely stale; a market with a fresh heartbeat AND recent settlement can never be forced off the ER. |
 
 Every proven pure function is the one the deployed handler routes through
-(`apply_fill` → `advance_settlement_seq`, `liquidate_position` →
+(`apply_fill` / `apply_lp_fill` → `advance_settlement_seq`, `liquidate_position` →
 `worse_of_health_price`, `assess_margin` → the proven gate, …), so the
 proofs bind to the shipped logic, not a copy.
 

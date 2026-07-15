@@ -450,24 +450,18 @@ pub fn inflight_sub(data: &mut [u8], cap: u32, position: &[u8; 32], delta: u64) 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settlement nonce (part A / P-SETTLE-1). The pure core of the per-market
 // replay/reorder guard shared by `apply_fill` and `apply_lp_fill`: a settlement
-// must carry a `fill_seq` STRICTLY greater than the market's current nonce, and
-// the nonce then advances to exactly that value. Extracted here so the monotonic
+// must carry exactly the next sequence value. Extracted here so the gap-free
 // property is machine-checked (below) and both settlement handlers call the same
 // proven function.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Advance the settlement nonce. `Ok(fill_seq)` iff `fill_seq > current`
-/// (rejects replays + out-of-order settlements); the returned nonce is exactly
-/// `fill_seq` and strictly exceeds `current`. `Err(())` leaves the caller to
-/// reject without mutating state.
+/// Advance the settlement nonce. `Ok(next)` iff `fill_seq == current + 1`.
+/// Replays, skipped values, and overflow are rejected without mutating state.
 #[allow(clippy::result_unit_err)] // the caller maps the erased error to a program error
 #[inline]
 pub fn advance_settlement_seq(current: u64, fill_seq: u64) -> Result<u64, ()> {
-    if fill_seq > current {
-        Ok(fill_seq)
-    } else {
-        Err(())
-    }
+    let next = current.checked_add(1).ok_or(())?;
+    (fill_seq == next).then_some(next).ok_or(())
 }
 
 /// FV: machine-checked monotonicity of the settlement nonce (Kani, multiply-free
@@ -477,26 +471,32 @@ pub fn advance_settlement_seq(current: u64, fill_seq: u64) -> Result<u64, ()> {
 mod settlement_seq_kani_proofs {
     use super::advance_settlement_seq;
 
-    /// A non-increasing seq (replay or out-of-order) is REJECTED.
+    /// Any value other than the next sequence value is rejected.
     #[kani::proof]
-    fn nonce_rejects_non_increasing() {
+    fn nonce_rejects_non_next_value() {
         let current: u64 = kani::any();
         let fill_seq: u64 = kani::any();
-        kani::assume(fill_seq <= current);
+        match current.checked_add(1) {
+            Some(next) => kani::assume(fill_seq != next),
+            None => {}
+        }
         assert!(advance_settlement_seq(current, fill_seq).is_err());
     }
 
-    /// A successful advance strictly increases the nonce to EXACTLY `fill_seq`.
+    /// A successful advance is exactly one step and matches the supplied value.
     #[kani::proof]
-    fn nonce_advance_is_strict_and_exact() {
+    fn nonce_advance_is_exactly_next() {
         let current: u64 = kani::any();
         let fill_seq: u64 = kani::any();
         match advance_settlement_seq(current, fill_seq) {
             Ok(next) => {
-                assert!(next > current);
+                assert!(next == current + 1);
                 assert!(next == fill_seq);
             }
-            Err(()) => assert!(fill_seq <= current),
+            Err(()) => match current.checked_add(1) {
+                Some(next) => assert!(fill_seq != next),
+                None => {}
+            },
         }
     }
 
@@ -648,6 +648,15 @@ mod tests {
         let mut a = [0u8; 32];
         a[0] = n;
         a
+    }
+
+    #[test]
+    fn settlement_sequence_is_exact_and_gap_free() {
+        assert_eq!(advance_settlement_seq(0, 1), Ok(1));
+        assert_eq!(advance_settlement_seq(41, 42), Ok(42));
+        assert!(advance_settlement_seq(41, 41).is_err());
+        assert!(advance_settlement_seq(41, 43).is_err());
+        assert!(advance_settlement_seq(u64::MAX, u64::MAX).is_err());
     }
 
     // §3.2 regression: the commitment preimage MUST be sensitive to

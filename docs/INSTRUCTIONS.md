@@ -155,7 +155,7 @@ noted).
 | `propose_authority_transfer` / `accept_authority_transfer` / `cancel_authority_transfer` | authority / new key / authority | Two-step transfer; the new key must sign to accept. |
 | `lock_oracle_source` | authority | One-way: permanently disables direct-authority oracle writes. |
 | `burn_market_authority` | authority | Irreversibly relinquish authority. |
-| `set_market_sequencer` | authority | Rotate the fill-settlement signer. |
+| `set_market_sequencer` | authority | Rotate the ER operational signer for liveness and margin attestation; fill settlement is ring-authenticated and permissionless. |
 | `init_fee_tiers` / `update_fee_tiers` | authority | Volume-tier fee table (validated, capped). |
 
 ## Sequencer committee

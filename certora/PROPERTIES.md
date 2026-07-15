@@ -114,11 +114,11 @@ position set.
 
 ## 4. Settlement integrity
 
-**P-SETTLE-1 — No replay.** Each settlement carries a `fill_seq` strictly greater
-than `market.last_settlement_seq`, which it then advances atomically; a replayed
-or out-of-order settlement reverts the whole transaction.
+**P-SETTLE-1 — No replay or gap.** Each settlement carries exactly
+`market.last_settlement_seq + 1`, which it then advances atomically; a replayed,
+out-of-order, or skipped settlement reverts the whole transaction.
 → **`[KANI]`** `advance_settlement_seq` (`matcher::fill_commitment`) —
-`nonce_rejects_non_increasing`, `nonce_advance_is_strict_and_exact`,
+`nonce_rejects_non_next_value`, `nonce_advance_is_exactly_next`,
 `nonce_chain_strictly_monotone`. Both `apply_fill` and `apply_lp_fill` route
 through the proven helper.
 

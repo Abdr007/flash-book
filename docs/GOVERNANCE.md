@@ -79,9 +79,10 @@ envelope never touches it.
 
 - `burn_market_authority` permanently relinquishes market authority — the
   end state for a market that should live under immutable parameters.
-- `set_market_sequencer` rotates the fill-settlement signer; the
-  commitment ring keeps settlement authenticity invariant across
-  rotations.
+- `set_market_sequencer` rotates the ER operational signer for authenticated
+  heartbeats, margin attestations, and privileged keeper actions. The
+  commitment ring makes fill settlement permissionless and independent of this
+  key.
 - `set_sequencer_committee` creates or rotates the BFT validator-set
   primitive (see `docs/DECENTRALIZED_SEQUENCER.md`); rotation clears
   equivocation-jail state and bumps the committee epoch.

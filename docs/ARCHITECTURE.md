@@ -3,7 +3,7 @@
 Clober is an on-chain central limit order book (CLOB) perpetual-futures
 engine for Solana. Matching runs at rollup speed on a MagicBlock Ephemeral
 Rollup (ER); custody, risk, and settlement live on the base layer (L1). The
-program surface is 162 instructions, 146 events, and 120 typed errors
+program surface is 162 instructions, 146 events, and 121 typed errors
 (`idl/clober.json` is the source of truth).
 
 ```mermaid

@@ -58,9 +58,8 @@ impl ErMarginAttestation {
 }
 
 /// Advance the attestation epoch. STRICTLY increasing only — a replayed or
-/// stale attestation (epoch ≤ current) is rejected. Mirror of
-/// `matcher::fill_commitment::advance_settlement_seq`, kept here so the
-/// reserved-margin path has its own proven monotonic guard.
+/// stale attestation (epoch ≤ current) is rejected. This is an independent
+/// monotonic guard for the reserved-margin path.
 #[inline]
 pub fn advance_epoch(current: u64, proposed: u64) -> Result<u64> {
     require!(proposed > current, CloberError::ErEpochReplay);
