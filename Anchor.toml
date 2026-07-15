@@ -2,16 +2,19 @@
 resolution = true
 skip-lint = false
 
+[toolchain]
+anchor_version = "1.1.2"
+
 # Build the SBF artifact with `cargo build-sbf --tools-version v1.52`
 # (platform-tools v1.52 = rustc 1.89; earlier releases cannot compile
 # edition2024 dependencies). The integration suite loads the compiled .so:
 # run tests with SBF_OUT_DIR=<repo>/target/deploy.
 
 [programs.localnet]
-clober = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+clober = "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
 
 [programs.devnet]
-clober = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq"
+clober = "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z"
 
 [provider]
 cluster = "devnet"

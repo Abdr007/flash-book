@@ -47,7 +47,7 @@ All economic parameter changes (fees, margins, funding, oracle band, LP
 coefficients, …) go through the timelocked path via `PendingParamUpdateAccount`
 (`["pending_params", market]`). **K-3:** the immediate `update_market_params`
 instruction no longer changes economic params — it is restricted to a single
-safety operation, enabling a *disabled* (legacy, pre-bound-era)
+safety operation, enabling a *disabled* pre-bound-era
 oracle-staleness gate (`oracle_staleness_max_seconds == 0` → a sane
 `[MIN_HEAL_STALENESS_SECONDS, MAX_HEAL_STALENESS_SECONDS]` value), with every
 other field required byte-identical to the live params. So it cannot change
@@ -79,9 +79,10 @@ envelope never touches it.
 
 - `burn_market_authority` permanently relinquishes market authority — the
   end state for a market that should live under immutable parameters.
-- `set_market_sequencer` rotates the fill-settlement signer; the
-  commitment ring keeps settlement authenticity invariant across
-  rotations.
+- `set_market_sequencer` rotates the ER operational signer for authenticated
+  heartbeats, margin attestations, and privileged keeper actions. The
+  commitment ring makes fill settlement permissionless and independent of this
+  key.
 - `set_sequencer_committee` creates or rotates the BFT validator-set
   primitive (see `docs/DECENTRALIZED_SEQUENCER.md`); rotation clears
   equivocation-jail state and bumps the committee epoch.

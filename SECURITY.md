@@ -8,8 +8,7 @@ real value against the current code.
 The engine is code-complete for its current scope, with machine-checked
 invariants in CI (see `docs/FORMAL_VERIFICATION.md`). The gates that remain
 before real value are a professional external audit and the operational
-steps in `docs/OPERATIONS.md` (per-market fill-commitment v1 upgrade,
-multisig authority migration).
+steps in `docs/OPERATIONS.md` (multisig authority migration).
 
 ## Reporting a vulnerability
 
@@ -31,8 +30,8 @@ acknowledge within 72 hours.
   cause incorrect collateral movement, position state, oracle acceptance,
   liquidation-reward routing, or account-control bypass.
 - The risk math in `programs/clober/src/matcher/`: anything that
-  violates the invariants in `docs/MARGIN_MATH.md` / `docs/HAIRCUT_MATH.md` /
-  `docs/SAFETY.md`. The conservation and solvency invariants are
+  violates the invariants in `INVARIANTS.md` / `docs/MARGIN_MATH.md` /
+  `docs/HAIRCUT_MATH.md`. The conservation and solvency invariants are
   machine-checked — a violation that Kani/Lean should have caught is a
   doubly interesting report.
 - The ER boundary: anything that lets a sequencer or any third party forge,
@@ -62,10 +61,12 @@ the code and the documentation tell the same story an external auditor will:
 - **Single-sequencer ordering/liveness.** Fill ordering and matching
   liveness trust the market's configured sequencer. Fund-safety does not:
   settlement authenticity is enforced on L1 by the fill-commitment ring
-  (`apply_fill` verifies every fill), the sequencer cannot route a fill to
-  the wrong account (trader-state PDAs are re-derived at settlement), and a
-  censoring or dead ER can be permissionlessly force-undelegated after a
-  proven-silent timeout. Full statement: `ER_TRUST_BOUNDARY.md` §1.
+  (`apply_fill` verifies every fill), and the sequencer cannot route a fill to
+  the wrong account (trader-state PDAs are re-derived at settlement). The
+  permissionless force-undelegation gate is implemented and proven, but the
+  deployed delegation program has no owner-callable recovery instruction; a
+  censored or dead ER currently requires sequencer cooperation to exit. Full
+  statement: `ER_TRUST_BOUNDARY.md` §1.
 - **Sequencer-attested ER reserved margin (the withdraw-anytime window).**
   Collateral is authoritative on L1 while resting orders live on the ER, so
   the margin a live ER order reserves reaches L1 only through the
@@ -91,7 +92,7 @@ the code and the documentation tell the same story an external auditor will:
 
 ## External audit
 
-Not yet engaged. The audit entry points are: `docs/SAFETY.md` (threat model
+Not yet engaged. The audit entry points are: `INVARIANTS.md` (threat model
 and invariants), `ER_TRUST_BOUNDARY.md` (trust boundary + what is proven
 where), `docs/SETTLEMENT.md` (settlement authenticity design),
 `docs/FORMAL_VERIFICATION.md` (proof inventory), and the reproducible test

@@ -6,7 +6,7 @@
 //!
 //! Inventory skew (Avellaneda-Stoikov-inspired):
 //!   skew_bps = -λ_bps · (pool_net_q / pool_capital_q)
-//! (we omit the volatility-coupled risk-aversion term in v1 of the Rust port;
+//! (we omit the volatility-coupled risk-aversion term in this Rust port;
 //! it's a pure-Rust enhancement to be added without behavioural surprises).
 //!
 //! All math uses checked u128 / i128 arithmetic. No floats.
@@ -322,7 +322,7 @@ pub fn order_notional_ok(
     notional >= min_notional_quote_lots as u128
 }
 
-/// HARD INVENTORY CAP (increment 3): the pool's net-position notional must not
+/// Hard inventory cap: the pool's net-position notional must not
 /// exceed its capital (a conservative ~1× exposure limit). Returns
 /// `(skip_bids, skip_asks)` for `lp_refresh_quotes`: when the pool is at the
 /// LONG cap it stops posting BIDs (a filled bid would grow its long — a taker

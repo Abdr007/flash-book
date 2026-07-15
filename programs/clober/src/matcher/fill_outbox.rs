@@ -30,8 +30,8 @@
 //! overwritten only at `produced = i`, whose previous occupant was written at
 //! `produced = i − cap < settled` — i.e. already settled and consumed. A slow
 //! sequencer is given hard backpressure (the taker's tx reverts `FillRingFull`)
-//! rather than being silently lapped. This is exactly OpenBook v2's
-//! `assert!(!is_full())` posture, inherited for free from the ring.
+//! rather than being silently lapped. This follows the same bounded-stream
+//! posture as established orderbook designs.
 //!
 //! ## Account layout (raw PDA `[fill_outbox, market]`)
 //! Fixed 64-byte header (mirrors the ring header so the ER delegate/commit code is

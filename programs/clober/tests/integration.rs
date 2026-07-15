@@ -8,7 +8,7 @@
 //! the AccountInfo Vec for the duration of the instruction).
 //!
 //! This is the same pattern used by upstream Anchor projects with
-//! solana-program-test integration; see e.g. mango-v4's tests.
+//! solana-program-test integration using a compiled SBF program.
 
 use anchor_lang::{prelude::*, InstructionData};
 use clober::state::{
@@ -30,7 +30,7 @@ use solana_system_interface::program as system_program;
 
 // Must match `declare_id!()` in src/lib.rs — Anchor verifies this at
 // runtime via the DeclaredProgramIdMismatch gate (Anchor error 4100).
-const PROGRAM_ID_STR: &str = "5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq";
+const PROGRAM_ID_STR: &str = "8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z";
 
 fn program_id() -> Pubkey {
     PROGRAM_ID_STR.parse().unwrap()
@@ -193,7 +193,7 @@ fn default_params() -> MarketParams {
         funding_per_period_max_bps: 0,
         funding_period_seconds: 0,
         bootstrap_period_batches: 0,
-        // V3 mark-engine params (off by default — legacy/test-suite parity).
+        // mark engine params (off by default — baseline/test-suite parity).
         mark_ema_alpha_bps: 0,
         mark_max_change_bps: 0,
         mark_settle_min_slots: 0,
@@ -462,7 +462,7 @@ async fn setup_market(
     let oracle_account = Keypair::new().pubkey();
 
     let (market, _) = pda(&[MarketAccount::SEED, base_mint.as_ref(), quote_mint.as_ref()]);
-    // (v1 order_buffer PDA — not derived; markets use the v2 hypertree
+    // (current order_buffer PDA — not derived; markets use the hypertree
     // PDA via book_state::MARKET_BOOK_SEED.)
     let order_buffer = Pubkey::default();
 
@@ -496,41 +496,7 @@ async fn setup_market(
         .await
         .unwrap();
 
-    disarm_fill_commitment(ctx, market).await;
     (protocol, market, order_buffer, base_mint, quote_mint)
-}
-
-/// production markets are fill-commitment-MANDATORY by default
-/// (`initialize_market_inner` sets `fill_commitment_required = true`), so a
-/// compromised sequencer can never settle a fabricated fill on an un-armed
-/// market. The authenticity path has dedicated coverage
-/// (`fill_commitment_honest_path_taker_cross_then_apply_fill`,
-/// `apply_fill_rejects_fabricated_fill_when_armed`,
-/// `armed_apply_fill_rejects_when_commitment_account_omitted`). Every OTHER
-/// settlement test exercises orthogonal logic (PnL/OI/margin/liquidation/funding)
-/// and would otherwise have to seed a matching commitment for each setup fill;
-/// instead they run against the (valid) un-armed config by flipping the flag back
-/// off here. `fill_commitment_required` is a real per-market field, so this is a
-/// legitimate test configuration, not a runtime bypass.
-async fn disarm_fill_commitment(ctx: &mut solana_program_test::ProgramTestContext, market: Pubkey) {
-    use solana_sdk::account::Account as SolAccount;
-    let acc = ctx.banks_client.get_account(market).await.unwrap().unwrap();
-    let mut m = clober::state::MarketAccount::try_deserialize(&mut acc.data.as_slice()).unwrap();
-    m.fill_commitment_required = false;
-    let mut data = Vec::new();
-    m.try_serialize(&mut data).unwrap();
-    data.resize(acc.data.len(), 0);
-    ctx.set_account(
-        &market,
-        &SolAccount {
-            lamports: acc.lamports,
-            data,
-            owner: acc.owner,
-            executable: acc.executable,
-            rent_epoch: acc.rent_epoch,
-        }
-        .into(),
-    );
 }
 
 /// CU-benchmark helper: zero the market's `initial_margin_ratio_bps`
@@ -599,7 +565,7 @@ async fn setup_additional_market(
     let oracle_account = Keypair::new().pubkey();
 
     let (market, _) = pda(&[MarketAccount::SEED, base_mint.as_ref(), quote_mint.as_ref()]);
-    // (v1 order_buffer PDA — not derived; markets use the v2 hypertree
+    // (current order_buffer PDA — not derived; markets use the hypertree
     // PDA via book_state::MARKET_BOOK_SEED.)
     let order_buffer = Pubkey::default();
 
@@ -633,7 +599,6 @@ async fn setup_additional_market(
         .await
         .unwrap();
 
-    disarm_fill_commitment(ctx, market).await; // §3.2 P2 — see helper doc
     (market, order_buffer, base_mint, quote_mint)
 }
 
@@ -1618,7 +1583,7 @@ async fn initialize_market_writes_state() {
     assert_eq!(market.status, 1);
     assert_eq!(market.params.tick_size, 1);
     assert_eq!(market.params.lp_quote_levels, 5);
-    // no v1 order_buffer; v2 markets use the hypertree-backed
+    // no current order_buffer; native markets use the hypertree-backed
     // market_book PDA initialized separately via init_market_book.
 }
 
@@ -1728,7 +1693,7 @@ async fn crank_funding_uses_robust_median_mark_from_the_book() {
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await; // oracle == mark == 100_000
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
-    // Init the v2 book.
+    // Init the native book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -2061,7 +2026,7 @@ impl Reconciled {
         use clober::{
             CollateralDepositedEvent, CollateralWithdrawnEvent, FillAppliedEvent,
             FundingCrankedEvent, FundingSettledEvent, GainReleasedToHaircutEvent,
-            LpFillAppliedEvent, OrderCancelledV2Event, OrderPlacedV2Event,
+            LpFillAppliedEvent, OrderCancelledEvent, OrderPlacedEvent,
         };
         for line in logs {
             let Some(b64) = line.strip_prefix("Program data: ") else {
@@ -2128,13 +2093,13 @@ impl Reconciled {
                     *self.collateral.entry(e.maker).or_default() += e.maker_rebate_paid as i128;
                     self.insurance += e.insurance_contribution_paid as i128;
                 }
-            } else if disc == <OrderPlacedV2Event as anchor_lang::Discriminator>::DISCRIMINATOR {
-                if let Ok(e) = OrderPlacedV2Event::try_from_slice(body) {
+            } else if disc == <OrderPlacedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = OrderPlacedEvent::try_from_slice(body) {
                     self.book
                         .insert(e.seq, (e.price_ticks, e.size_lots, e.side));
                 }
-            } else if disc == <OrderCancelledV2Event as anchor_lang::Discriminator>::DISCRIMINATOR {
-                if let Ok(e) = OrderCancelledV2Event::try_from_slice(body) {
+            } else if disc == <OrderCancelledEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
+                if let Ok(e) = OrderCancelledEvent::try_from_slice(body) {
                     self.book.remove(&e.order_seq);
                 }
             } else if disc == <LpFillAppliedEvent as anchor_lang::Discriminator>::DISCRIMINATOR {
@@ -2301,19 +2266,19 @@ async fn set_market_stress_tier_gates_leverage_by_backstop() {
     send(&mut ctx, tier_ix(300, 3000), &payer)
         .await
         .expect("covered tier must be accepted");
-    let m2: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m2.stress_shock_bps, 300);
-    assert_eq!(m2.backstop_tail_bps, 3000);
-    assert_eq!(m2.effective_stress_shock_bps(), 300);
+    let updated_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(updated_market.stress_shock_bps, 300);
+    assert_eq!(updated_market.backstop_tail_bps, 3000);
+    assert_eq!(updated_market.effective_stress_shock_bps(), 300);
 
-    // (5) Off-switch (0, 0) ⇒ reverts to full legacy; always accepted.
+    // (5) Off-switch (0, 0) ⇒ reverts to full baseline; always accepted.
     send(&mut ctx, tier_ix(0, 0), &payer)
         .await
         .expect("off-switch must always be accepted");
-    let m3: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m3.stress_shock_bps, 0);
-    assert_eq!(m3.backstop_tail_bps, 0);
-    assert_eq!(m3.effective_stress_shock_bps(), 3000); // legacy ±30%
+    let baseline_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(baseline_market.stress_shock_bps, 0);
+    assert_eq!(baseline_market.backstop_tail_bps, 0);
+    assert_eq!(baseline_market.effective_stress_shock_bps(), 3000); // baseline ±30%
 }
 
 #[tokio::test]
@@ -2417,6 +2382,20 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
         maker_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        taker.pubkey(),
+        maker.pubkey(),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
 
     // Immutable market config the reconciler is told (tick_size = 1 by default).
     let mut recon = Reconciled {
@@ -2458,7 +2437,7 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 2,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -2473,6 +2452,7 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let insurance_before: InsuranceFundAccount =
@@ -2555,7 +2535,7 @@ async fn d19_reconciler_rebuilds_book_from_orders() {
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
-    // Init the v2 hypertree book.
+    // Init the hypertree book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -2659,7 +2639,6 @@ async fn d19_reconciler_rebuilds_lp_inventory_from_a_lp_fill() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await;
     let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
 
@@ -2675,6 +2654,20 @@ async fn d19_reconciler_rebuilds_lp_inventory_from_a_lp_fill() {
     let mut recon = Reconciled::default();
     // LP is the maker: trader buys 1 lot @ 100_000 from the LP, which takes the
     // opposite (short) side. LpFillApplied carries the absolute LP inventory.
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        trader.pubkey(),
+        lp_exposure,
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyLpFill {
             size_lots: 1,
@@ -2695,6 +2688,7 @@ async fn d19_reconciler_rebuilds_lp_inventory_from_a_lp_fill() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let logs = send_capture(&mut ctx, ix, &payer.pubkey(), &[&payer]).await;
@@ -2724,7 +2718,6 @@ async fn d19_reconciler_rebuilds_haircut_reserve_from_release() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await;
 
     // A cross position via apply_fill, then the haircut engine enabled and a real
     // gain release into the reserve.
@@ -2853,7 +2846,6 @@ async fn conservation_sequence_fuzz() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await;
 
     let traders: Vec<Keypair> = (0..4).map(|_| Keypair::new()).collect();
     let mut states = Vec::new();
@@ -3076,7 +3068,7 @@ async fn update_market_params_rejects_immutable_primitive_change() {
 // ─────────────────────────────────────────────────────────────────────────────
 // `update_market_params` is restricted to ONE operation.
 //
-// The immediate (un-timelocked) path may ONLY heal a legacy market whose
+// The immediate (un-timelocked) path may ONLY heal a baseline market whose
 // oracle-staleness gate was never enabled — i.e. `oracle_staleness_max_seconds
 // == 0` — by setting it to a sane value in [MIN_HEAL_STALENESS_SECONDS=60,
 // MAX_HEAL_STALENESS_SECONDS=86_400]. Every OTHER change (all economic params,
@@ -3092,15 +3084,15 @@ async fn update_market_params_rejects_immutable_primitive_change() {
 //
 // Setup wrinkle: `initialize_market` requires `oracle_staleness_max_seconds > 0`,
 // so a freshly-created market NEVER has 0. To exercise the heal SUCCESS path we
-// simulate a legacy market by deserializing the market account, setting the field
+// simulate a baseline market by deserializing the market account, setting the field
 // to 0, re-serializing, and writing it back with `set_account` (mirroring the
-// `disarm_fill_commitment` / `zero_initial_margin` patch helpers above).
+// `zero_initial_margin` patch helper above).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Patch a market's `oracle_staleness_max_seconds` to 0 in place, simulating a
-/// legacy market created before the staleness bound existed. Uses the same
+/// baseline market created before the staleness bound existed. Uses the same
 /// deserialize → mutate → re-serialize → `set_account` technique as
-/// `disarm_fill_commitment` / `zero_initial_margin`.
+/// `zero_initial_margin`.
 async fn patch_staleness_to_zero(
     ctx: &mut solana_program_test::ProgramTestContext,
     market: Pubkey,
@@ -3168,7 +3160,7 @@ async fn update_market_params_k3_economic_change_rejected_on_live_market() {
     assert_eq!(market.params.taker_fee_bps, default_params().taker_fee_bps);
 }
 
-/// (2/4): heal SUCCESS. A legacy market (staleness == 0) is healed by
+/// (2/4): heal SUCCESS. A baseline market (staleness == 0) is healed by
 /// enabling the gate to a sane value; every other field is byte-identical.
 #[tokio::test]
 async fn update_market_params_k3_heal_success() {
@@ -3178,7 +3170,7 @@ async fn update_market_params_k3_heal_success() {
 
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
-    // Simulate a legacy market with a disabled staleness gate.
+    // Simulate a baseline market with a disabled staleness gate.
     patch_staleness_to_zero(&mut ctx, market_pda).await;
     let before: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
@@ -3215,7 +3207,7 @@ async fn update_market_params_k3_heal_success() {
     );
 }
 
-/// (3/4): heal REJECTS an out-of-range staleness. A legacy market, but the
+/// (3/4): heal REJECTS an out-of-range staleness. A baseline market, but the
 /// requested value (10s) is below MIN_HEAL_STALENESS_SECONDS (60).
 #[tokio::test]
 async fn update_market_params_k3_heal_rejects_out_of_range() {
@@ -3259,7 +3251,7 @@ async fn update_market_params_k3_heal_rejects_out_of_range() {
     assert_eq!(after.params.oracle_staleness_max_seconds, 0);
 }
 
-/// (4/4): heal REJECTS a piggybacked other-field change. A legacy market,
+/// (4/4): heal REJECTS a piggybacked other-field change. A baseline market,
 /// requested staleness is in range (3600) BUT an economic field also differs —
 /// the masked-hash equality must catch the smuggled change.
 #[tokio::test]
@@ -3381,12 +3373,12 @@ async fn deposit_lp_capital_grows_pool() {
     assert_eq!(vs.amount, 6_000_000);
 }
 
-/// The singleton and per-market v3 LP pools redeem from one vault, so LP shares
+/// The singleton and per-market LP pools redeem from one vault, so LP shares
 /// in both would double-count the same PnL. Once the singleton mints shares it
-/// claims the protocol-wide `LpModeAccount`; a v3 deposit then fails closed
+/// claims the protocol-wide `LpModeAccount`; a native deposit then fails closed
 /// with LpSystemModeConflict.
 #[tokio::test]
-async fn lp_mode_lock_forbids_v3_after_singleton() {
+async fn lp_mode_lock_forbids_market_pool_after_singleton() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -3395,15 +3387,15 @@ async fn lp_mode_lock_forbids_v3_after_singleton() {
     // Singleton mints shares → claims MODE_SINGLETON.
     seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
 
-    let result = try_v3_deposit(&mut ctx, &payer, &protocol, market_pda).await;
+    let result = try_market_lp_deposit(&mut ctx, &payer, &protocol, market_pda).await;
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8321)"),
-        "v3 deposit after singleton must be rejected with LpSystemModeConflict, got: {dbg}"
+        "native deposit after singleton must be rejected with LpSystemModeConflict, got: {dbg}"
     );
 }
 
-/// Reverse direction: once a v3 pool mints shares it claims the mode, and a
+/// Reverse direction: once a per-market pool mints shares it claims the mode, and a
 /// singleton `lp_deposit` then fails closed.
 #[tokio::test]
 async fn lp_mode_lock_forbids_singleton_after() {
@@ -3412,9 +3404,9 @@ async fn lp_mode_lock_forbids_singleton_after() {
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
-    // v3 mints shares first → claims MODE_V3 (must succeed).
-    let ok = try_v3_deposit(&mut ctx, &payer, &protocol, market_pda).await;
-    assert!(ok.is_ok(), "first v3 deposit must succeed, got: {ok:?}");
+    // native mints shares first → claims MODE_PER_MARKET (must succeed).
+    let ok = try_market_lp_deposit(&mut ctx, &payer, &protocol, market_pda).await;
+    assert!(ok.is_ok(), "first native deposit must succeed, got: {ok:?}");
 
     // Singleton deposit must now be rejected.
     let lp_ata = create_ata(&mut ctx, &payer, payer.pubkey(), protocol.quote_mint).await;
@@ -3453,13 +3445,13 @@ async fn lp_mode_lock_forbids_singleton_after() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8321)"),
-        "singleton deposit after v3 must be rejected with LpSystemModeConflict, got: {dbg}"
+        "singleton deposit after native must be rejected with LpSystemModeConflict, got: {dbg}"
     );
 }
 
-/// Set up the v3 per-market pool + a funded LP and attempt one v3 deposit.
+/// Set up the native per-market pool + a funded LP and attempt one native deposit.
 /// Returns the deposit tx result so callers can assert allow/reject.
-async fn try_v3_deposit(
+async fn try_market_lp_deposit(
     ctx: &mut solana_program_test::ProgramTestContext,
     payer: &Keypair,
     protocol: &Protocol,
@@ -3590,7 +3582,7 @@ async fn withdraw_lp_capital_blocked_with_open_positions() {
         .await
         .unwrap();
 
-    // H8: the LP minimum hold (LP_MIN_HOLD_SLOTS) now gates withdrawals.
+    // minimum-hold: the LP minimum hold (LP_MIN_HOLD_SLOTS) now gates withdrawals.
     // Advance past it so the legitimate withdraw succeeds.
     ctx.warp_to_slot(1_000).unwrap();
 
@@ -3821,7 +3813,7 @@ async fn lp_units_withdraw_burns_shares_and_distributes_nav() {
         alice.pubkey().as_ref(),
     ]);
 
-    // H8: advance past the LP minimum hold before withdrawing.
+    // minimum-hold: advance past the LP minimum hold before withdrawing.
     ctx.warp_to_slot(1_000).unwrap();
 
     // Alice burns 1M shares. NAV/share = 7M/7M = 1.0 → returns 1M USDC.
@@ -4333,20 +4325,26 @@ async fn second_market_initializes_at_different_oracle_price() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
-    let (_protocol, m1, _, _, _) = setup_market(&mut ctx, &payer).await;
-    let (m2, _, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
+    let (_protocol, first_market, _, _, _) = setup_market(&mut ctx, &payer).await;
+    let (second_market, _, _, _) = setup_additional_market(&mut ctx, &payer, 200_000).await;
 
-    let market1: MarketAccount = fetch(&mut ctx.banks_client, m1).await;
-    let market2: MarketAccount = fetch(&mut ctx.banks_client, m2).await;
+    let first_market_state: MarketAccount = fetch(&mut ctx.banks_client, first_market).await;
+    let second_market_state: MarketAccount = fetch(&mut ctx.banks_client, second_market).await;
 
-    assert_eq!(market1.oracle_price_ticks, 100_000);
-    assert_eq!(market2.oracle_price_ticks, 200_000);
-    assert_ne!(market1.base_mint, market2.base_mint);
-    assert_ne!(market1.quote_mint, market2.quote_mint);
+    assert_eq!(first_market_state.oracle_price_ticks, 100_000);
+    assert_eq!(second_market_state.oracle_price_ticks, 200_000);
+    assert_ne!(first_market_state.base_mint, second_market_state.base_mint);
+    assert_ne!(
+        first_market_state.quote_mint,
+        second_market_state.quote_mint
+    );
     // Both should share the same authority + global PDAs.
-    assert_eq!(market1.authority, market2.authority);
-    assert_eq!(market1.lp_pool, market2.lp_pool);
-    assert_eq!(market1.insurance_fund, market2.insurance_fund);
+    assert_eq!(first_market_state.authority, second_market_state.authority);
+    assert_eq!(first_market_state.lp_pool, second_market_state.lp_pool);
+    assert_eq!(
+        first_market_state.insurance_fund,
+        second_market_state.insurance_fund
+    );
 }
 
 #[tokio::test]
@@ -4465,7 +4463,6 @@ async fn apply_lp_fill_creates_taker_position_and_lp_entry() {
     let payer = ctx.payer.insecure_clone();
 
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await; // the legacy sequencer path is unarmed-only
     let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     let trader = Keypair::new();
@@ -4483,6 +4480,20 @@ async fn apply_lp_fill_creates_taker_position_and_lp_entry() {
 
     // Apply a fill where trader buys 1 lot @ 100,000 from LP.
     let (insurance_fund_pda_for_lpfill, _) = pda(&[InsuranceFundAccount::SEED]);
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        trader.pubkey(),
+        lp_exposure,
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyLpFill {
             size_lots: 1,
@@ -4507,6 +4518,7 @@ async fn apply_lp_fill_creates_taker_position_and_lp_entry() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -4555,7 +4567,6 @@ async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await;
     let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
@@ -4569,6 +4580,20 @@ async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
         trader_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        trader.pubkey(),
+        lp_exposure,
+        0,
+        1,
+        102_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let fill = build_ix(
         clober::instruction::ApplyLpFill {
             size_lots: 1,
@@ -4589,6 +4614,7 @@ async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -4682,15 +4708,15 @@ async fn deposit_lp_capital_prices_on_mark_to_market_nav() {
     );
 }
 
-/// HLP (1b) — the POOL-BACKED CLOB full loop: the LP pool posts a resting maker
+/// liquidity pool (1b) — the POOL-BACKED CLOB full loop: the LP pool posts a resting maker
 /// quote on the book (`lp_post_maker_order`, owner = the lp_exposure PDA); a
 /// taker crosses it via `place_taker_order`, which pushes a STANDARD fill
 /// commitment (maker = the LP PDA); then a ROGUE keeper (NOT market.sequencer)
 /// settles it via the RING-AUTHENTICATED `apply_lp_fill` path. Asserts the fill
 /// is authentic + permissionless, and the pool takes the opposite side — the
-/// Hyperliquid HLP model, on-chain and trust-minimized.
+/// On-chain, trust-minimized liquidity pool model.
 #[tokio::test]
-async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
+async fn liquidity_pool_lp_maker_order_crossed_and_settled_permissionlessly() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -4717,7 +4743,14 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
         ix: Instruction,
         signers: &[&Keypair],
     ) -> std::result::Result<(), solana_program_test::BanksClientError> {
-        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        // The test intentionally submits the same execute instruction before
+        // and after changing the pending ETA. A fresh blockhash keeps the
+        // signatures distinct; otherwise the latter is treated as a replay of
+        // the earlier rejected transaction.
+        let bh = ctx
+            .get_new_latest_blockhash()
+            .await
+            .unwrap_or(ctx.last_blockhash);
         ctx.banks_client
             .process_transaction(Transaction::new_signed_with_payer(
                 &[ix],
@@ -4728,7 +4761,7 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
             .await
     }
 
-    // 1) init the v2 book + arm the fill-commitment ring.
+    // 1) init the native book + arm the fill-commitment ring.
     send(
         &mut ctx,
         build_ix(
@@ -4830,14 +4863,13 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
     send(
         &mut ctx,
         build_ix(
-            // Pass fill_seq = u64::MAX on the RING path — it must be
-            // IGNORED (auto-incremented), NOT wedge last_settlement_seq. Asserted below.
+            // The first settlement must use the exact next sequence value.
             clober::instruction::ApplyLpFill {
                 size_lots: 1,
                 price_ticks: 100_000,
                 taker_side: 0,
                 taker_sub_index: 0,
-                fill_seq: u64::MAX,
+                fill_seq: 1,
                 taker_was_jit: false,
             },
             vec![
@@ -4861,7 +4893,7 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
 
     // taker long 1 @ 100k; pool took the opposite side (short 1 @ 100k).
     let position: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
-    assert_eq!(position.side, 0, "taker long after HLP fill");
+    assert_eq!(position.side, 0, "taker long after liquidity pool fill");
     assert_eq!(position.size_lots, 1);
     assert_eq!(position.entry_price_ticks, 100_000);
     let lp: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
@@ -4873,13 +4905,12 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
     assert_eq!(entry.side, 1, "pool short after being crossed as maker");
     assert_eq!(entry.size_lots, 1);
     assert_eq!(entry.entry_price_ticks, 100_000);
-    // The caller-supplied fill_seq (u64::MAX) is IGNORED on the ring path —
-    // the nonce auto-incremented to 1 rather than wedging at u64::MAX. A permissionless
-    // caller cannot brick the market's settlement.
+    // The exact sequence advances to 1 while the commitment ring keeps the
+    // settlement permissionless.
     let mkt: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
         mkt.last_settlement_seq, 1,
-        "ring-path nonce auto-increments; caller fill_seq ignored"
+        "ring-path nonce advances through the exact supplied sequence"
     );
 }
 
@@ -4887,7 +4918,7 @@ async fn hlp_lp_maker_order_crossed_and_settled_permissionlessly() {
 /// fill-commitment supplied) is REJECTED — the ring is mandatory, matching
 /// `apply_fill`. Without this a compromised sequencer could fabricate LP
 /// fills within the ±LP_MAX_FILL_DEVIATION_BPS band and drain LP capital.
-/// Only UNARMED (legacy) markets accept the sequencer + oracle-band path.
+/// Only UNARMED (baseline) markets accept the sequencer + oracle-band path.
 #[tokio::test]
 async fn apply_lp_fill_armed_requires_ring_rejects_sequencer_path() {
     let pt = make_program_test();
@@ -4902,7 +4933,7 @@ async fn apply_lp_fill_armed_requires_ring_rejects_sequencer_path() {
         market_pda.as_ref(),
     ]);
     seed_lp_capital(&mut ctx, &payer, &protocol, 5_000_000).await;
-    // setup_market DISARMS; re-ARM (init_fill_commitment sets fill_commitment_required=true).
+    // Initialize the commitment ring for this test.
     {
         let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
         ctx.banks_client
@@ -4993,12 +5024,12 @@ async fn apply_lp_fill_armed_requires_ring_rejects_sequencer_path() {
     );
 }
 
-/// HLP (increment 2) — the pool AUTO-QUOTES: `lp_refresh_quotes` runs the
+/// The liquidity pool auto-quotes: `lp_refresh_quotes` runs the
 /// deterministic quoter and posts a two-sided ladder owned by the pool, then a
 /// taker crosses the pool's own ask → a ring-committed LP-maker fill. Proves the
 /// quoter → book → cross pipeline: the pool is now a self-managing on-book MM.
 #[tokio::test]
-async fn hlp_lp_refresh_quotes_posts_crossable_ladder() {
+async fn liquidity_pool_lp_refresh_quotes_posts_crossable_ladder() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -5172,7 +5203,6 @@ async fn apply_lp_fill_rejects_price_far_from_oracle() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await; // the legacy sequencer path is unarmed-only
     let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
 
     let trader = Keypair::new();
@@ -5234,14 +5264,14 @@ async fn apply_lp_fill_rejects_price_far_from_oracle() {
 /// band) fails with RestingOrderTooFarFromOracle; an ask @ 140_000 (40%, inside)
 /// succeeds.
 #[tokio::test]
-async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
+async fn place_limit_rejects_far_from_oracle_resting_order() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
 
-    // init the v2 book.
+    // init the native book.
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -5323,7 +5353,7 @@ async fn place_limit_v2_rejects_far_from_oracle_resting_order() {
 /// A 6-sig-fig in-band price (123_457) is rejected (PriceTooManySignificantFigures, 8326);
 /// a 5-sig-fig in-band price (123_450 — the trailing zero is not significant) is accepted.
 #[tokio::test]
-async fn place_limit_v2_enforces_5_significant_figures() {
+async fn place_limit_enforces_5_significant_figures() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -5408,7 +5438,7 @@ async fn place_limit_v2_enforces_5_significant_figures() {
 /// (size × price × tick) is below the floor is rejected (OrderNotionalTooSmall, 8327);
 /// one at/above the floor is accepted.
 #[tokio::test]
-async fn place_limit_v2_enforces_min_notional() {
+async fn place_limit_enforces_min_notional() {
     use solana_sdk::account::Account as SolAccount;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -5516,7 +5546,7 @@ async fn place_limit_v2_enforces_min_notional() {
 }
 
 /// 4.3: place_ladder_order rests `num_levels` orders in one tx (each a full
-/// place_limit_v2_core, so every per-order gate applies), stepping AWAY from mid; and
+/// place_limit_core, so every per-order gate applies), stepping AWAY from mid; and
 /// rejects reduce_only. A 3-rung ask ladder (105_000 / 106_000 / 107_000) rebuilds to 3
 /// resting orders via the event reconciler.
 #[tokio::test]
@@ -5605,7 +5635,7 @@ async fn place_ladder_order_rests_multiple_levels() {
 /// (inside the 50% band around the 100_000 oracle), then modify it to 200_000
 /// (100% above) and assert RestingOrderTooFarFromOracle.
 #[tokio::test]
-async fn modify_order_v2_rejects_far_from_oracle() {
+async fn modify_order_rejects_far_from_oracle() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -5699,7 +5729,7 @@ async fn modify_order_v2_rejects_far_from_oracle() {
 /// reducible size at fill, so it can never open or flip — safety proven by the existing
 /// reduce_only_taker / v1_reduce_only_trigger tests).
 #[tokio::test]
-async fn modify_order_v2_accepts_reduce_only_flag() {
+async fn modify_order_accepts_reduce_only_flag() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -5792,12 +5822,11 @@ async fn modify_order_v2_accepts_reduce_only_flag() {
 /// is bound to (trader, trigger.sub_index): a sub_index=0 trigger executed with
 /// the wallet's sub_index=1 position is rejected with WrongTrader.
 #[tokio::test]
-async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
+async fn execute_trigger_order_rejects_foreign_subaccount_position() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await;
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
     async fn send(
@@ -5864,6 +5893,20 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
         market_pda.as_ref(),
         counter_state.as_ref(),
     ]);
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        m.pubkey(),
+        counter.pubkey(),
+        0,
+        1,
+        100_000,
+        1,
+        0,
+        false,
+    )
+    .await;
     send(
         &mut ctx,
         build_ix(
@@ -5889,6 +5932,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
                 AccountMeta::new_readonly(program_id(), false),
                 AccountMeta::new_readonly(program_id(), false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(ring, false),
             ],
         ),
         &[&payer],
@@ -5969,12 +6013,11 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_position() {
 /// FUNDED sub-account to satisfy the intake-IM gate while the order opens on a
 /// near-empty one.
 #[tokio::test]
-async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
+async fn execute_trigger_order_rejects_foreign_subaccount_trader_state() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await;
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (insurance, _) = pda(&[InsuranceFundAccount::SEED]);
     async fn send(
@@ -6045,6 +6088,20 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
         market_pda.as_ref(),
         counter_state.as_ref(),
     ]);
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        m.pubkey(),
+        counter.pubkey(),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     send(
         &mut ctx,
         build_ix(
@@ -6070,6 +6127,7 @@ async fn execute_trigger_order_v3_rejects_foreign_subaccount_trader_state() {
                 AccountMeta::new_readonly(program_id(), false),
                 AccountMeta::new_readonly(program_id(), false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(ring, false),
             ],
         ),
         &[&payer],
@@ -6293,7 +6351,7 @@ async fn update_oracle_from_pyth_rejects_replayed_publish_time() {
 }
 
 #[tokio::test]
-async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band() {
+async fn liquidate_position_jit_auction_selects_in_band_rejects_out_of_band() {
     use solana_sdk::account::Account as SolAccount;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -6505,7 +6563,7 @@ async fn liquidate_position_v2_jit_auction_selects_in_band_rejects_out_of_band()
 /// the liquidation penalty) must yield ZERO reward — otherwise the reward would
 /// be funded by the insurance fund via cover_bad_debt.
 #[tokio::test]
-async fn liquidate_position_v2_reward_capped_at_synthetic_equity() {
+async fn liquidate_position_reward_capped_at_synthetic_equity() {
     use solana_sdk::account::Account as SolAccount;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -7264,139 +7322,6 @@ async fn deposit_collateral_rejects_wrong_trader_state() {
     );
 }
 
-/// Migrate a Position from the legacy `(market, wallet)` PDA to the
-/// canonical `(market, trader_state)` PDA. After migration the
-/// legacy address is closed (rent refunded) and the new address holds
-/// the same on-chain state.
-#[tokio::test]
-async fn migrate_position_to_trader_state_key_moves_state() {
-    use solana_sdk::account::Account as SolanaAccount;
-    let pt = make_program_test();
-    let mut ctx_setup = pt.start_with_context().await;
-    let payer = ctx_setup.payer.insecure_clone();
-    let (protocol, market_pda, _, _, _) = setup_market(&mut ctx_setup, &payer).await;
-    let trader = Keypair::new();
-    let trader_state = setup_trader(&mut ctx_setup, &payer, &trader, 50_000, &protocol).await;
-
-    // Pre-seed a "legacy" Position at [POS_SEED, market, wallet] by
-    // directly setting it in the test ledger — simulates a position
-    // created before the trader_state-keyed layout. (We cannot create one through the normal
-    // ix path anymore because the handlers all use the new PDA.)
-    let (legacy_pos, legacy_bump) = pda(&[
-        clober::state::PositionAccount::SEED,
-        market_pda.as_ref(),
-        trader.pubkey().as_ref(),
-    ]);
-    let pos_space = clober::state::PositionAccount::space();
-    let legacy_pos_data = {
-        let mut buf = vec![0u8; pos_space];
-        // 8-byte discriminator for PositionAccount.
-        let disc = <clober::state::PositionAccount as anchor_lang::Discriminator>::DISCRIMINATOR;
-        buf[..8].copy_from_slice(disc);
-        // PositionAccount is `#[account(zero_copy)]` (Pod), so it does not
-        // implement AnchorSerialize. Write the Pod bytes
-        // directly after the discriminator via bytemuck. Field order is
-        // irrelevant here (named-field literal) and bytemuck preserves the
-        // exact in-memory layout the on-chain `load()` expects.
-        let pos = clober::state::PositionAccount {
-            market: to_anchor(market_pda),
-            trader: to_anchor(trader.pubkey()),
-            bump: legacy_bump,
-            side: 0,
-            size_lots: 7,
-            entry_price_ticks: 12_345,
-            collateral_quote_lots: 0,
-            cum_funding_index_at_entry: [0u8; 16],
-            realized_pnl_quote_lots: 0,
-            funding_paid_quote_lots: 0,
-            last_settlement_batch: 0,
-            unhealthy_since_slot: 0,
-            last_liquidated_at_slot: 0,
-            // Non-zero: the trader set a tighter self-imposed cap. Migration
-            // must preserve it (0 is the "use market max" sentinel, so a drop
-            // silently relaxes the guardrail).
-            leverage_cap: 5,
-            _pad: [0u8; 2],
-        };
-        let serialized = bytemuck::bytes_of(&pos);
-        buf[8..8 + serialized.len()].copy_from_slice(serialized);
-        buf
-    };
-    ctx_setup.set_account(
-        &legacy_pos,
-        &SolanaAccount {
-            lamports: 10_000_000,
-            data: legacy_pos_data,
-            owner: program_id(),
-            executable: false,
-            rent_epoch: 0,
-        }
-        .into(),
-    );
-
-    // Sanity: legacy is readable, new doesn't exist yet.
-    let legacy_before: clober::state::PositionAccount =
-        fetch(&mut ctx_setup.banks_client, legacy_pos).await;
-    assert_eq!(legacy_before.size_lots, 7);
-
-    let (new_pos, _) = pda(&[
-        clober::state::PositionAccount::SEED,
-        market_pda.as_ref(),
-        trader_state.as_ref(),
-    ]);
-    let new_before = ctx_setup.banks_client.get_account(new_pos).await.unwrap();
-    assert!(
-        new_before.is_none(),
-        "new PDA should be empty pre-migration"
-    );
-
-    // Run the migration.
-    let ix = build_ix(
-        clober::instruction::MigratePositionToTraderStateKey {},
-        vec![
-            AccountMeta::new(trader.pubkey(), true),
-            AccountMeta::new_readonly(market_pda, false),
-            AccountMeta::new_readonly(trader_state, false),
-            AccountMeta::new(legacy_pos, false),
-            AccountMeta::new(new_pos, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh = ctx_setup.banks_client.get_latest_blockhash().await.unwrap();
-    ctx_setup
-        .banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&trader.pubkey()),
-            &[&trader],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // Legacy should be closed, new should hold the same state.
-    let legacy_after = ctx_setup
-        .banks_client
-        .get_account(legacy_pos)
-        .await
-        .unwrap();
-    assert!(
-        legacy_after.is_none() || legacy_after.unwrap().lamports == 0,
-        "legacy Position must be closed after migration"
-    );
-    let new_after: clober::state::PositionAccount =
-        fetch(&mut ctx_setup.banks_client, new_pos).await;
-    assert_eq!(new_after.market, to_anchor(market_pda));
-    assert_eq!(new_after.trader, to_anchor(trader.pubkey()));
-    assert_eq!(new_after.side, 0);
-    assert_eq!(new_after.size_lots, 7);
-    assert_eq!(new_after.entry_price_ticks, 12_345);
-    // The trader's per-position leverage cap must survive the migration; a
-    // dropped field would land at 0 (the "use market max" sentinel) and
-    // silently remove the guardrail.
-    assert_eq!(new_after.leverage_cap, 5);
-}
-
 // ─── End-to-end ApplyFill integration tests ───────────────────────
 //
 // Fee routing, realized-PnL materialisation, and sub_index PDA
@@ -7444,52 +7369,18 @@ async fn apply_fill_caps_uncollectable_maker_fee_instead_of_wedging() {
     let maker = Keypair::new();
     let taker_state = setup_trader(&mut ctx, &payer, &taker, 100_000, &protocol).await;
     let maker_state = setup_trader(&mut ctx, &payer, &maker, 0, &protocol).await;
-    let (taker_pos, _) = pda(&[
-        clober::state::PositionAccount::SEED,
-        market_pda.as_ref(),
-        taker_state.as_ref(),
-    ]);
-    let (maker_pos, _) = pda(&[
-        clober::state::PositionAccount::SEED,
-        market_pda.as_ref(),
-        maker_state.as_ref(),
-    ]);
-
-    let ix = build_ix(
-        clober::instruction::ApplyFill {
-            size_lots: 1,
-            price_ticks: 100_000,
-            taker_side: 0,
-            taker_was_jit: false,
-            taker_sub_index: 0,
-            maker_sub_index: 0,
-            fill_seq: 1,
-        },
-        vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(market_pda, false),
-            AccountMeta::new(protocol.insurance_fund, false),
-            AccountMeta::new(taker_state, false),
-            AccountMeta::new(maker_state, false),
-            AccountMeta::new(taker_pos, false),
-            AccountMeta::new(maker_pos, false),
-            AccountMeta::new_readonly(program_id(), false),
-            AccountMeta::new_readonly(program_id(), false),
-            AccountMeta::new_readonly(program_id(), false),
-            AccountMeta::new_readonly(program_id(), false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .expect("an uncollectable maker fee must be capped, not wedge settlement");
+    let _ = apply_one_fill(
+        &mut ctx,
+        &payer,
+        market_pda,
+        protocol.insurance_fund,
+        taker_state,
+        maker_state,
+        1,
+        100_000,
+        1,
+    )
+    .await;
 
     let maker_after: TraderStateAccount = fetch(&mut ctx.banks_client, maker_state).await;
     assert_eq!(maker_after.collateral_quote_lots, 0);
@@ -7528,6 +7419,20 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
         maker_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        taker.pubkey(),
+        maker.pubkey(),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
 
     // taker buys 1 lot @ 100_000 ticks from maker.
     let ix = build_ix(
@@ -7538,7 +7443,7 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 2,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -7556,12 +7461,13 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
-            // H1: clone so the original `ix` survives for the replay assertion below.
+            // replay-protection: clone so the original `ix` survives for the replay assertion below.
             std::slice::from_ref(&ix),
             Some(&payer.pubkey()),
             &[&payer],
@@ -7586,15 +7492,13 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market.oi_long_lots, 1);
     assert_eq!(market.oi_short_lots, 1);
-    // H1: the settlement nonce advanced to the applied fill_seq.
-    assert_eq!(market.last_settlement_seq, 2);
+    // The commitment-backed settlement sequence is assigned by the program.
+    assert_eq!(market.last_settlement_seq, 1);
 
-    // ── H1 replay guard ─────────────────────────────────────────────────
-    // Re-submitting the IDENTICAL fill (same fill_seq = 2 ≤ last_settlement_seq)
-    // must be rejected on-chain — this is the crashed/restarting-sequencer
-    // re-emit case. A fresh blockhash (via a slot warp) makes it a DISTINCT
-    // transaction so it actually reaches the program (not deduped by the
-    // runtime), proving the on-chain guard — not tx-dedup — is what rejects it.
+    // ── replay-protection replay guard ─────────────────────────────────────────────────
+    // Re-submitting the identical fill must fail because its commitment was
+    // consumed. A fresh blockhash makes this a distinct transaction, proving the
+    // on-chain FIFO consumer rather than transaction de-duplication rejects it.
     ctx.warp_to_slot(100).unwrap();
     let bh2 = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let replay = ctx
@@ -7606,16 +7510,13 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             bh2,
         ))
         .await;
-    assert!(
-        replay.is_err(),
-        "replayed fill (fill_seq <= last_settlement_seq) must be rejected"
-    );
+    assert!(replay.is_err(), "a consumed commitment must reject replay");
 
-    // The replay had NO effect: OI is unchanged and the nonce is still 2.
+    // The replay had no effect: OI is unchanged and the sequence is still 1.
     let market_after: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(market_after.oi_long_lots, 1, "replay must not double OI");
     assert_eq!(market_after.oi_short_lots, 1, "replay must not double OI");
-    assert_eq!(market_after.last_settlement_seq, 2);
+    assert_eq!(market_after.last_settlement_seq, 1);
 }
 
 /// ── Residual: an UNDELEGATED-L1 resting order's IM is UNRESERVED, yet the
@@ -7675,8 +7576,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
     // Zero all fee/rebate params so the money-path assertions isolate PnL +
     // bad-debt routing (no fee/rebate leaking value into/out of the
     // collateral+insurance system). These are real per-market fields — a
-    // legitimate test config, same technique as `zero_initial_margin` /
-    // `disarm_fill_commitment`. `initial_margin_ratio_bps` is LEFT nonzero
+    // legitimate test config. `initial_margin_ratio_bps` is left nonzero
     // (250) so the intake IM gate the residual is about stays live.
     {
         let acc = ctx
@@ -7706,7 +7606,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
         );
     }
 
-    // Init the v2 book so an L1 limit order can rest.
+    // Init the native book so an L1 limit order can rest.
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
@@ -7853,7 +7753,8 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
                  maker_pos: Pubkey,
                  taker_side: u8,
                  price: u64,
-                 seq: u64| {
+                 seq: u64,
+                 ring: Pubkey| {
         build_ix(
             clober::instruction::ApplyFill {
                 size_lots: 10,
@@ -7877,6 +7778,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
                 AccountMeta::new_readonly(program_id(), false), // None taker_position_haircut
                 AccountMeta::new_readonly(program_id(), false), // None maker_position_haircut
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(ring, false),
             ],
         )
     };
@@ -7884,6 +7786,20 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
     // Fill 1 — the sequencer settles the victim's resting BUY: the victim
     // (maker) goes LONG 10 @ 100_000 with ZERO backing (the unreserved residual
     // made real), the counterparty (taker, taker_side=1/sell) goes SHORT.
+    let open_ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        cpty.pubkey(),
+        victim.pubkey(),
+        1,
+        10,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -7895,6 +7811,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
                 1,
                 100_000,
                 1,
+                open_ring,
             )],
             Some(&payer.pubkey()),
             &[&payer],
@@ -7923,6 +7840,20 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
     // Fill 2 — adverse close at 50_000: the victim (maker, sells) realizes a
     // −500_000 loss it cannot fund; the counterparty (taker, taker_side=0/buy)
     // realizes +500_000. size·Δticks·tick = 10·(100_000−50_000)·1 = 500_000.
+    let close_ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        cpty.pubkey(),
+        victim.pubkey(),
+        0,
+        10,
+        50_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let close_res = ctx
         .banks_client
@@ -7935,6 +7866,7 @@ async fn residual_undelegated_l1_resting_order_unreserved_but_loss_bounded() {
                 0,
                 50_000,
                 2,
+                close_ring,
             )],
             Some(&payer.pubkey()),
             &[&payer],
@@ -8040,7 +7972,7 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 3,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(rogue.pubkey(), true), // rogue, NOT market.sequencer
@@ -9342,7 +9274,7 @@ async fn reconcile_unsettled_fill_volume_resets_only_when_ring_drained() {
     );
 }
 
-/// HONEST PATH, end-to-end on the v2 hypertree book:
+/// HONEST PATH, end-to-end on the hypertree book:
 /// init book + arm fill_commitment → maker rests an ask → taker crosses it
 /// (`place_taker_order` pushes a keccak commitment for the real fill) →
 /// `apply_fill` recomputes the SAME commitment and consume-and-clears it, opening
@@ -9398,7 +9330,7 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
             .await
     }
 
-    // 1) init the v2 book + arm the fill-commitment ring.
+    // 1) init the native book + arm the fill-commitment ring.
     send(
         &mut ctx,
         build_ix(
@@ -9559,14 +9491,11 @@ async fn fill_commitment_honest_path_taker_cross_then_apply_fill() {
     assert_eq!(taker_p.size_lots, 1, "taker size 1 lot");
 }
 
-/// A freshly-armed market's ring is born v1 (account at the v1 length, version
-/// byte stamped 1) so the reduce-in-flight tracker is live from the first fill;
-/// the legacy v0→v1 upgrade handler rejects an already-v1 ring. A v1 ring still
-/// settles a normal (non-reduce-only) fill correctly — i.e. the version-gated
-/// settlement path (reduce_flag_take / inflight_sub) is inert for ordinary fills
-/// and does not regress the honest settle path.
+/// A freshly armed market receives the complete settlement layout, so the
+/// reduce-in-flight tracker is live from the first fill. Ordinary fills must still
+/// settle correctly while the tracker remains inert.
 #[tokio::test]
-async fn armed_ring_is_v1_at_init_and_settles_normally() {
+async fn armed_ring_initializes_tracking_and_settles_normally() {
     use clober::matcher::fill_commitment as fc;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -9608,7 +9537,7 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
             .await
     }
 
-    // init book + arm the ring (v0, cap 256).
+    // Initialize the book and arm the settlement ring.
     send(
         &mut ctx,
         build_ix(
@@ -9640,8 +9569,8 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
     .await
     .unwrap();
 
-    // A freshly-armed ring is born v1: v1 length, version byte 1. The
-    // reduce-in-flight tracker is live from the first fill without any upgrade.
+    // The freshly armed ring includes the reduce-in-flight tracker from the first
+    // fill without a migration step.
     let d1 = ctx
         .banks_client
         .get_account(fc_pda)
@@ -9652,35 +9581,11 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
     assert_eq!(
         d1.len(),
         fc::fill_commit_account_len(256),
-        "v1 length at init"
-    );
-    assert_eq!(d1[29], 1, "fresh ring is v1");
-
-    // The legacy v0→v1 upgrade handler now rejects an already-v1 ring
-    // (`buffer_upgrade_to` requires version 0); it survives only for markets
-    // armed before v1 became the default.
-    let upgrade_res = send(
-        &mut ctx,
-        build_ix(
-            clober::instruction::UpgradeFillCommitment {},
-            vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
-                AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-        ),
-        &[&payer],
-    )
-    .await;
-    assert!(
-        upgrade_res.is_err(),
-        "upgrading an already-v1 ring must be rejected"
+        "complete settlement layout length at init"
     );
 
-    // A NORMAL (non-reduce-only) fill still settles on the v1 ring: maker rests an
-    // ask, taker crosses, apply_fill drains it. Proves the v1-gated settlement path
-    // is inert for ordinary fills.
+    // A normal (non-reduce-only) fill still settles: maker rests an ask, taker
+    // crosses, and apply_fill drains the commitment. The tracking state stays inert.
     send(
         &mut ctx,
         build_ix(
@@ -9759,7 +9664,7 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
         &[&payer],
     )
     .await
-    .expect("honest committed fill must settle on a v1 ring");
+    .expect("honest committed fill must settle on the initialized ring");
 
     // Ring drained (1,1) and the in-flight map is untouched (no reduce-only fill).
     let d = ctx
@@ -9776,17 +9681,14 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
     assert_eq!(
         (u64::from_le_bytes(p), u64::from_le_bytes(s)),
         (1, 1),
-        "v1 ring settles the normal fill exactly once"
+        "ring settles the normal fill exactly once"
     );
     let taker_p: clober::state::PositionAccount = fetch(&mut ctx.banks_client, taker_pos).await;
     assert_eq!(taker_p.side, 0);
-    assert_eq!(
-        taker_p.size_lots, 1,
-        "taker long 1 after settling on the v1 ring"
-    );
+    assert_eq!(taker_p.size_lots, 1, "taker long 1 after settlement");
 }
 
-/// The DEFINITIVE end-to-end proof, on a v1 ring, that the
+/// The definitive end-to-end proof that the
 /// reduce-in-flight tracking prevents the position FLIP across the match→settle gap.
 ///
 /// Scenario (the exact residual the injection clamp couldn't reach): a maker M holds
@@ -9794,11 +9696,11 @@ async fn armed_ring_is_v1_at_init_and_settles_normally() {
 /// SHRINKS the position below that resting order. Two separate takers then try to
 /// over-cross the oversized reduce-only order across the settle gap. Without the
 /// migration, the second taker (reading a stale position snapshot) would fill and
-/// flip M into an under-margined short. With the v1 in-flight tracking, the matcher
+/// flip M into an under-margined short. With in-flight tracking, the matcher
 /// caps the second cross by `position − in-flight` = 0 — so M reduces to exactly flat
 /// and never flips. Settlement then releases the in-flight back to zero.
 #[tokio::test]
-async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
+async fn reduce_only_trigger_two_takers_cannot_flip_position() {
     use clober::matcher::fill_commitment as fc;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -9842,7 +9744,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
             ))
             .await
     }
-    // Read a position's pending reduce-in-flight straight out of the v1 map region.
+    // Read a position's pending reduce-in-flight straight out of the map region.
     async fn read_inflight(
         ctx: &mut solana_program_test::ProgramTestContext,
         fc_pda: Pubkey,
@@ -9967,7 +9869,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
         )
     };
 
-    // init book + ring, then MIGRATE the ring to v1.
+    // Initialize the book and complete settlement layout.
     send(
         &mut ctx,
         build_ix(
@@ -9998,8 +9900,7 @@ async fn v1_reduce_only_trigger_two_takers_cannot_flip_position() {
     )
     .await
     .unwrap();
-    // The ring is armed at v1 by `init_fill_commitment`, so the reduce-in-flight
-    // tracker is live immediately — no upgrade step needed.
+    // The reduce-in-flight tracker is live immediately.
 
     // 1) M opens LONG 10: C rests ask 10, M takes buy 10, settle.
     send(&mut ctx, limit(1, 10, &c, &c_state), &[&payer, &c])
@@ -10570,6 +10471,20 @@ async fn partial_withdraw_rejects_omitted_position() {
 
     // Open a real position for the taker (size 1 @ 100k → ~1x leverage),
     // so `taker_state.open_positions == 1`.
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        taker.pubkey(),
+        maker.pubkey(),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let fill_ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots: 1,
@@ -10578,7 +10493,7 @@ async fn partial_withdraw_rejects_omitted_position() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 4,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // payer IS market.sequencer
@@ -10593,6 +10508,7 @@ async fn partial_withdraw_rejects_omitted_position() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -10869,12 +10785,12 @@ async fn deep_book_matching_cu_curve() {
     // default 32 KiB SBF heap can't hold the fills Vec + FillBatchEvent past
     // ~100 levels). With the request, the full {1..256} curve to the matcher's
     // FINDING: a single taker's `fills` Vec + the FillBatchEvent clone exhaust the
-    // The matcher's batch cap (MAX_BATCH_ORDERS_PER_SIDE_V2) is sized so its three
+    // The matcher's batch cap (MAX_MATCH_BATCH_ORDERS) is sized so its three
     // simultaneous heap buffers (pre-sized `matches` + `fills` + serialized
     // FillBatchEvent) fit the default 32 KiB SBF heap — so a single tx crosses up
     // to the cap WITHOUT OOM-panicking and WITHOUT needing a heap-frame request.
     // Deeper requests truncate gracefully (verified below).
-    let cap = clober::MAX_BATCH_ORDERS_PER_SIDE_V2 as u64;
+    let cap = clober::MAX_MATCH_BATCH_ORDERS as u64;
     let mut sweep = Vec::new();
     for n in [1u64, 2, 4, 8, 16, 32, 64, cap] {
         let cu = cu_of(
@@ -11480,7 +11396,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
 
-    let fill_metas = || {
+    let fill_metas = |ring: Pubkey| {
         vec![
             AccountMeta::new(payer.pubkey(), true), // payer == market.sequencer
             AccountMeta::new(market_pda, false),
@@ -11494,10 +11410,25 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ]
     };
 
     // (1) apply_fill — OPEN (creates both position PDAs, moves OI).
+    let open_ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        taker.pubkey(),
+        maker.pubkey(),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let open_ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots: 1,
@@ -11506,9 +11437,9 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 5,
+            fill_seq: 1,
         },
-        fill_metas(),
+        fill_metas(open_ring),
     );
     let cu_apply_fill_open = cu_of(&mut ctx, open_ix, &payer.pubkey(), &[&payer]).await;
 
@@ -11534,6 +11465,20 @@ async fn cu_benchmark_settlement_and_risk_paths() {
     let cu_partial_withdraw = cu_of(&mut ctx, pw_ix, &taker.pubkey(), &[&taker]).await;
 
     // (3) apply_fill — CLOSE (taker sells 1, realizes PnL → materialise).
+    let close_ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        taker.pubkey(),
+        maker.pubkey(),
+        1,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let close_ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots: 1,
@@ -11542,39 +11487,28 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 6,
+            fill_seq: 2,
         },
-        fill_metas(),
+        fill_metas(close_ring),
     );
     let cu_apply_fill_close = cu_of(&mut ctx, close_ix, &payer.pubkey(), &[&payer]).await;
 
     // ── Gated hot paths: oracle band + fill commitment ─────────────────
-    // Set up the v2 book + arm the commitment ring (one-time; not measured).
+    // Set up the native book + arm the commitment ring (one-time; not measured).
     let (book_pda, _) = pda(&[clober::book_state::MARKET_BOOK_SEED, market_pda.as_ref()]);
     let (fc_pda, _) = pda(&[
         clober::matcher::fill_commitment::FILL_COMMIT_SEED,
         market_pda.as_ref(),
     ]);
-    for ix in [
-        build_ix(
-            clober::instruction::InitMarketBook {},
-            vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market_pda, false),
-                AccountMeta::new(book_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-        ),
-        build_ix(
-            clober::instruction::InitFillCommitment { cap: 256 },
-            vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(market_pda, false),
-                AccountMeta::new(fc_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-        ),
-    ] {
+    for ix in [build_ix(
+        clober::instruction::InitMarketBook {},
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(market_pda, false),
+            AccountMeta::new(book_pda, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    )] {
         let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
         ctx.banks_client
             .process_transaction(Transaction::new_signed_with_payer(
@@ -11697,8 +11631,24 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
         counter_state.as_ref(),
     ]);
     let (insurance_fund_pda, _) = pda(&[InsuranceFundAccount::SEED]);
+    let taker_account: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    let counter_account: TraderStateAccount = fetch(&mut ctx.banks_client, counter_state).await;
 
     // ── Open: taker buys 1 lot @ 100_000 from counter. ─────────────
+    let open_ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        to_sdk(taker_account.trader),
+        to_sdk(counter_account.trader),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let open_ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots: 1,
@@ -11707,7 +11657,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 7,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -11723,6 +11673,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(open_ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -11753,6 +11704,20 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
     // Fee on the close: 1 * 110_000 * 1 * 5 / 10_000 = 55.
     // Net change on taker_state.collateral_quote_lots over the close:
     //   +10_000 (PnL credit) - 55 (taker fee) = +9_945.
+    let close_ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        to_sdk(taker_account.trader),
+        to_sdk(counter_account.trader),
+        1,
+        1,
+        110_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let close_ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots: 1,
@@ -11761,7 +11726,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 8,
+            fill_seq: 2,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -11777,6 +11742,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(close_ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -11883,7 +11849,7 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
             taker_was_jit: false,
             taker_sub_index: 0, // ← lying: actually passing sub_state
             maker_sub_index: 0,
-            fill_seq: 9,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -12272,7 +12238,7 @@ async fn grow_fill_commitment_raises_ring_cap() {
     assert_eq!(
         d.len(),
         fc::fill_commit_account_len(cap1 as usize),
-        "account resized to match new cap (v1 layout)"
+        "account resized to match new cap (native)"
     );
 }
 
@@ -12282,7 +12248,7 @@ async fn grow_fill_commitment_raises_ring_cap() {
 /// so a JIT depositor cannot slip in front of a NAV-lifting `record_lp_market_fill`
 /// and capture the windfall without bearing risk.
 #[tokio::test]
-async fn lp_withdraw_v3_enforces_min_hold() {
+async fn lp_market_withdraw_enforces_min_hold() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -12397,7 +12363,7 @@ async fn lp_withdraw_v3_enforces_min_hold() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(7208)"),
-        "immediate v3 LP withdraw must be rejected with RateLimited, got: {dbg}"
+        "immediate native LP withdraw must be rejected with RateLimited, got: {dbg}"
     );
 }
 
@@ -12407,7 +12373,7 @@ async fn lp_withdraw_v3_enforces_min_hold() {
 /// 110: with tick_size 1 the pool realizes exactly 10*(110-100) = 100 quote-lots
 /// and the inventory returns to empty.
 #[tokio::test]
-async fn record_lp_fill_v3_derives_realized_pnl_on_chain() {
+async fn record_lp_market_fill_derives_realized_pnl_on_chain() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -12505,7 +12471,7 @@ async fn record_lp_fill_v3_derives_realized_pnl_on_chain() {
 /// (socializing the drawdown onto the shared vault). With the mark folded in, the
 /// deposit is rejected `LpPoolInsolvent` (Custom(8308)).
 #[tokio::test]
-async fn lp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
+async fn lp_market_deposit_marks_inventory_and_rejects_when_insolvent() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -12670,7 +12636,7 @@ async fn lp_deposit_v3_marks_inventory_and_rejects_when_insolvent() {
     let dbg = format!("{result:?}");
     assert!(
         dbg.contains("Custom(8308)"),
-        "deposit into an MTM-insolvent v3 pool must be rejected LpPoolInsolvent, got: {dbg}"
+        "deposit into an MTM-insolvent per-market pool must be rejected LpPoolInsolvent, got: {dbg}"
     );
 }
 
@@ -12767,7 +12733,7 @@ async fn er_delegation_rejects_non_authority() {
 // ════════════════════════════════════════════════════════════════════════
 
 /// Open a CROSS position (long for `taker`, short for `maker`) on `market` via
-/// an UNARMED `apply_fill` (no fill-commitment ring). Cross ⇒
+/// a commitment-authenticated `apply_fill`. Cross ⇒
 /// `position.collateral_quote_lots == 0`, and the taker's
 /// `TraderState.open_positions` is incremented by one. Returns the taker's
 /// position PDA.
@@ -12814,6 +12780,22 @@ async fn open_cross_position_sized(
         market.as_ref(),
         maker_state.as_ref(),
     ]);
+    let taker: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    let maker: TraderStateAccount = fetch(&mut ctx.banks_client, maker_state).await;
+    let ring = seed_fill_commitment(
+        ctx,
+        payer,
+        market,
+        to_sdk(taker.trader),
+        to_sdk(maker.trader),
+        0,
+        size_lots,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots,
@@ -12837,6 +12819,7 @@ async fn open_cross_position_sized(
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -12848,7 +12831,7 @@ async fn open_cross_position_sized(
             bh,
         ))
         .await
-        .expect("unarmed apply_fill opens a cross position");
+        .expect("committed apply_fill opens a cross position");
     taker_pos
 }
 
@@ -12856,7 +12839,7 @@ async fn open_cross_position_sized(
 /// clears the cross gate, so execution reaches the self-liquidation guard,
 /// which rejects `caller == liquidatee` with `SelfLiquidationForbidden`.
 #[tokio::test]
-async fn liquidate_position_v2_rejects_self_liquidation() {
+async fn liquidate_position_rejects_self_liquidation() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -12931,7 +12914,7 @@ async fn liquidate_position_v2_rejects_self_liquidation() {
 /// liquidate a portfolio-healthy trader. It must route through
 /// liquidate_portfolio.
 #[tokio::test]
-async fn liquidate_position_v2_rejects_multi_leg_cross() {
+async fn liquidate_position_rejects_multi_leg_cross() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -13458,7 +13441,7 @@ async fn force_reduce_position_oracle_frees_isolated_margin() {
 /// completes — a HEALTHY trader with one stale sibling now returns NotLiquidatable,
 /// NOT a stale-abort. (The execution leg stays strict; it is patched fresh here.)
 #[tokio::test]
-async fn liquidate_portfolio_v2_stale_sibling_does_not_abort_walk() {
+async fn liquidate_portfolio_stale_sibling_does_not_abort_walk() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -13895,8 +13878,7 @@ async fn apply_lp_fill_rejects_stale_oracle() {
         ))
         .await
         .unwrap();
-    // LEGACY sequencer + oracle-staleness path → market must be UNARMED.
-    disarm_fill_commitment(&mut ctx, market_pda).await;
+    // BASELINE sequencer + oracle-staleness path → market must be UNARMED.
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
@@ -13910,6 +13892,20 @@ async fn apply_lp_fill_rejects_stale_oracle() {
     // (set to the genesis timestamp by initialize_market) is now stale.
     ctx.warp_to_slot(432_000).unwrap();
 
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        trader.pubkey(),
+        protocol.lp_exposure,
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyLpFill {
             size_lots: 1,
@@ -13930,6 +13926,7 @@ async fn apply_lp_fill_rejects_stale_oracle() {
             AccountMeta::new_readonly(program_id(), false), // haircut None ×2
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -13960,7 +13957,7 @@ async fn apply_lp_fill_rejects_stale_oracle() {
 /// opening collateral. A 0-collateral vault: an OPENING order is still rejected
 /// (InsufficientCollateral — intake gate intact), but a REDUCE-ONLY order is accepted.
 #[tokio::test]
-async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
+async fn vault_place_order_honors_reduce_only_and_exempts_the_intake_gate() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -14087,7 +14084,7 @@ async fn vault_place_order_v3_honors_reduce_only_and_exempts_the_intake_gate() {
 /// position is created through the REAL apply_fill path on the vault's own
 /// trader_state (no byte injection). → SweepRequiresFlat (1214 → Custom(7214)).
 #[tokio::test]
-async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
+async fn vault_withdraw_rejects_when_vault_has_open_position() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -14251,7 +14248,7 @@ async fn vault_withdraw_v3_rejects_when_vault_has_open_position() {
 /// `vault_deposit` must reject a deposit while the vault carries an open
 /// position, mirroring `vault_withdraw` (SweepRequiresFlat, Custom(7214)).
 #[tokio::test]
-async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
+async fn vault_deposit_rejects_when_vault_has_open_position() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -14402,7 +14399,7 @@ async fn vault_deposit_v3_rejects_when_vault_has_open_position() {
 /// non-canonical for the basket caller — is rejected with WrongTrader
 /// (1104 → Custom(7104)), preventing cross-trader position confusion.
 #[tokio::test]
-async fn place_basket_order_n_v2_rejects_noncanonical_position() {
+async fn place_basket_order_n_rejects_noncanonical_position() {
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -14797,6 +14794,20 @@ async fn apply_fill_requires_haircut_accounts_when_enabled() {
 
     // apply_fill that OMITS the haircut accounts (program-id None sentinels) must
     // now be rejected.
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        taker.pubkey(),
+        maker.pubkey(),
+        0,
+        1,
+        100_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots: 1,
@@ -14820,6 +14831,7 @@ async fn apply_fill_requires_haircut_accounts_when_enabled() {
             AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
             AccountMeta::new_readonly(program_id(), false), // maker_position_haircut None
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -14853,7 +14865,6 @@ async fn apply_lp_fill_band_rejects_ten_percent() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     let (protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
-    disarm_fill_commitment(&mut ctx, market_pda).await; // the legacy sequencer path is unarmed-only
 
     let trader = Keypair::new();
     let trader_state = setup_trader(&mut ctx, &payer, &trader, 50_000, &protocol).await;
@@ -14863,6 +14874,20 @@ async fn apply_lp_fill_band_rejects_ten_percent() {
         trader_state.as_ref(),
     ]);
 
+    let ring = seed_fill_commitment(
+        &mut ctx,
+        &payer,
+        market_pda,
+        trader.pubkey(),
+        protocol.lp_exposure,
+        0,
+        1,
+        110_000,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyLpFill {
             size_lots: 1,
@@ -14883,6 +14908,7 @@ async fn apply_lp_fill_band_rejects_ten_percent() {
             AccountMeta::new_readonly(program_id(), false), // market_haircut None
             AccountMeta::new_readonly(program_id(), false), // taker_position_haircut None
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -16414,7 +16440,7 @@ async fn claim_fee_accrual_rejects_empty_accrual() {
 /// tranche per call (the requested full close is clamped), leaving the rest to
 /// unwind over cooldown-spaced follow-up calls.
 #[tokio::test]
-async fn liquidate_position_v2_caps_close_at_one_tranche() {
+async fn liquidate_position_caps_close_at_one_tranche() {
     use solana_sdk::account::Account as SolAccount;
     let pt = make_program_test();
     let mut ctx = pt.start_with_context().await;
@@ -16677,7 +16703,7 @@ async fn phase2_setup(
         // validation, which is Phase 1's concern, not Phase 2's). A LOW shock (e.g.
         // 500 = 5%) scales the margin lattice so `required ≈ 5% of notional`, the
         // regime where a small partial close actually restores health. `0` keeps
-        // the legacy ±30% lattice (used for the bankrupt case).
+        // the baseline ±30% lattice (used for the bankrupt case).
         m.stress_shock_bps = stress_shock_bps;
         m.params.max_liq_tranche_lots = 0; // no tranche cap — close_size == requested
         m.params.liquidation_cooldown_slots = 0;
@@ -16810,7 +16836,7 @@ async fn liquidate_position_phase2_bankrupt_full_close_uncapped() {
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
     // collateral 1_000, mark 90_000 ⇒ equity(4) = 1_000 - 40_000 < 0 (bankrupt).
-    // Legacy market (stress 0) — the bankruptcy exemption is independent of tier.
+    // baseline market (stress 0) — the bankruptcy exemption is independent of tier.
     let (market, book, taker_state, liq_state, liq, taker_pos) =
         phase2_setup(&mut ctx, &payer, 1_000, 90_000, 0).await;
     phase2_send(
@@ -16895,12 +16921,12 @@ async fn set_market_correlation_writes_and_bounds() {
     phase2_send(&mut ctx, corr_ix(0, 0), &payer)
         .await
         .expect("off-switch must be accepted");
-    let m2: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m2.corr_group_id, 0);
-    assert_eq!(m2.corr_rho_bps, 0);
+    let reset_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(reset_market.corr_group_id, 0);
+    assert_eq!(reset_market.corr_rho_bps, 0);
 }
 
-// ── 3.1: paper-profit haircut crank (percolator per-domain credit) ──────────
+// ── Paper-profit haircut crank (per-domain credit) ──────────────────────────
 
 #[tokio::test]
 async fn set_paper_profit_haircut_cranks_and_gates_auth() {
@@ -16910,8 +16936,11 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Precondition: default is 0 (no haircut) for a fresh market.
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m0.paper_profit_haircut_bps, 0, "default must be no-haircut");
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        initial_market.paper_profit_haircut_bps, 0,
+        "default must be no-haircut"
+    );
 
     // Authority (payer) cranks the haircut to 3000 bps.
     let ix = build_ix(
@@ -16931,13 +16960,13 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
         ))
         .await
         .unwrap();
-    let m1: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let configured_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
-        m1.paper_profit_haircut_bps, 3000,
+        configured_market.paper_profit_haircut_bps, 3000,
         "crank must persist the haircut"
     );
     assert!(
-        m1.paper_haircut_updated_slot > 0,
+        configured_market.paper_haircut_updated_slot > 0,
         "crank must stamp the slot"
     );
 
@@ -16993,9 +17022,9 @@ async fn set_paper_profit_haircut_cranks_and_gates_auth() {
     );
 }
 
-// ── HIP-3: permissionless market creation ───────────────────────────────────
+// ── permissionless-market: permissionless market creation ───────────────────────────────────
 
-fn hip3_valid_params() -> MarketParams {
+fn permissionless_market_valid_params() -> MarketParams {
     MarketParams {
         max_leverage: 10,
         maintenance_margin_ratio_bps: 500,
@@ -17016,7 +17045,7 @@ fn hip3_valid_params() -> MarketParams {
         funding_per_period_max_bps: 50,
         funding_period_seconds: 3_600,
         // Mark engine must track the tape — a zero EMA weight would leave the
-        // mark permanently frozen (rejected by validate_hip3_params).
+        // mark permanently frozen (rejected by validate_permissionless_market_params).
         mark_ema_alpha_bps: 2_000,
         ..default_params()
     }
@@ -17076,7 +17105,8 @@ async fn create_permissionless_market_by_non_authority_succeeds_and_isolates() {
         .await
         .unwrap();
 
-    let (market, ix) = create_perm_market_ix(&creator, &protocol, hip3_valid_params()).await;
+    let (market, ix) =
+        create_perm_market_ix(&creator, &protocol, permissionless_market_valid_params()).await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -17103,10 +17133,6 @@ async fn create_permissionless_market_by_non_authority_succeeds_and_isolates() {
         creator.pubkey(),
         "creator earns the creator share"
     );
-    assert!(
-        m.fill_commitment_required,
-        "permissionless market is armed (fail-closed) by default"
-    );
 }
 
 #[tokio::test]
@@ -17132,10 +17158,10 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         .await
         .unwrap();
 
-    // 100x leverage is outside the HIP-3 envelope (max HIP3_MAX_LEVERAGE=65) →
+    // 100x leverage is outside the permissionless-market envelope (max PERMISSIONLESS_MAX_LEVERAGE=65) →
     // OutOfRange (7003). (The per-market maintenance floor still binds below this
     // ceiling; the ceiling itself rejects an absurd advertised leverage.)
-    let mut bad = hip3_valid_params();
+    let mut bad = permissionless_market_valid_params();
     bad.max_leverage = 100;
     let (_market, ix) = create_perm_market_ix(&creator, &protocol, bad).await;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -17151,14 +17177,14 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
         .unwrap_err();
     assert!(
         format!("{err:?}").contains("Custom(7003)"),
-        "predatory (100x) params must be rejected by the HIP-3 envelope, got: {err:?}"
+        "predatory (100x) params must be rejected by the permissionless-market envelope, got: {err:?}"
     );
 
     // Funding is a predatory lever too: a hostile creator must not be able to
     // set an unbounded funding rate (the drain-via-crank attack), omit the
     // required per-period backstop, or blow past the per-period cap.
     let make = |f: &dyn Fn(&mut MarketParams)| {
-        let mut p = hip3_valid_params();
+        let mut p = permissionless_market_valid_params();
         f(&mut p);
         p
     };
@@ -17198,7 +17224,7 @@ async fn create_permissionless_market_rejects_out_of_envelope_params() {
             .unwrap_err();
         assert!(
             format!("{err:?}").contains("Custom(7003)"),
-            "{label} must be rejected by the HIP-3 funding envelope, got: {err:?}"
+            "{label} must be rejected by the permissionless-market funding envelope, got: {err:?}"
         );
     }
 }
@@ -17334,9 +17360,9 @@ async fn copy_vault_deposit_mints_shares_and_withdraw_returns_proportional() {
         ata_state.amount, 1_000,
         "withdraw must return the full deposit"
     );
-    let v2: CopyVaultAccount = fetch(&mut ctx.banks_client, vault).await;
-    assert_eq!(v2.total_shares, 0);
-    assert_eq!(v2.total_assets_quote_lots, 0);
+    let emptied_vault: CopyVaultAccount = fetch(&mut ctx.banks_client, vault).await;
+    assert_eq!(emptied_vault.total_shares, 0);
+    assert_eq!(emptied_vault.total_assets_quote_lots, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17346,7 +17372,7 @@ async fn copy_vault_deposit_mints_shares_and_withdraw_returns_proportional() {
 // `set_oi_insurance_multiple_bps(bps)` instruction (accounts: authority signer +
 // market — the same `UpdateMarketAuthority` layout `update_market_params` uses):
 //
-//   * `bps == 0` (default / legacy) DISABLES the breaker entirely.
+//   * `bps == 0` (default / baseline) DISABLES the breaker entirely.
 //   * otherwise `bps` must lie in
 //     `[MIN_OI_INSURANCE_MULTIPLE_BPS = 10_000, MAX_OI_INSURANCE_MULTIPLE_BPS =
 //     100_000_000]`; out-of-range bps reject with `OutOfRange` = `Custom(7003)`.
@@ -17424,7 +17450,7 @@ async fn send_set_oi_multiple(
         .await
 }
 
-/// Init the v2 hypertree book for a market so intake (`place_limit_order`)
+/// Init the hypertree book for a market so intake (`place_limit_order`)
 /// can run against it.
 async fn init_market_book_for(
     ctx: &mut solana_program_test::ProgramTestContext,
@@ -17453,6 +17479,84 @@ async fn init_market_book_for(
     book_pda
 }
 
+/// Ensure a market has an initialized commitment ring and append one exact
+/// matcher-style commitment. Test fixtures use this only to construct a valid
+/// settlement precondition; production commitments are written by matching.
+#[allow(clippy::too_many_arguments)]
+async fn seed_fill_commitment(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    market: Pubkey,
+    taker: Pubkey,
+    maker: Pubkey,
+    taker_side: u8,
+    size_lots: u64,
+    price_ticks: u64,
+    taker_sub_index: u8,
+    maker_sub_index: u8,
+    taker_was_jit: bool,
+) -> Pubkey {
+    use solana_sdk::account::Account as SolAccount;
+
+    let (ring, _) = pda(&[
+        clober::matcher::fill_commitment::FILL_COMMIT_SEED,
+        market.as_ref(),
+    ]);
+    if ctx.banks_client.get_account(ring).await.unwrap().is_none() {
+        let ix = build_ix(
+            clober::instruction::InitFillCommitment { cap: 256 },
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(ring, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+        );
+        let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&payer.pubkey()),
+                &[payer],
+                bh,
+            ))
+            .await
+            .expect("initialize test commitment ring");
+    }
+
+    let account = ctx.banks_client.get_account(ring).await.unwrap().unwrap();
+    let mut data = account.data.clone();
+    let market_bytes = market.to_bytes();
+    let produced = clober::matcher::fill_commitment::buffer_next_index(&data);
+    let preimage = clober::matcher::fill_commitment::fill_preimage(
+        &market_bytes,
+        &taker.to_bytes(),
+        &maker.to_bytes(),
+        taker_side,
+        size_lots,
+        price_ticks,
+        taker_sub_index,
+        maker_sub_index,
+        produced,
+        taker_was_jit,
+    );
+    let commitment = solana_keccak_hasher::hashv(&[&preimage]).0;
+    clober::matcher::fill_commitment::buffer_push(&mut data, &market_bytes, commitment)
+        .expect("append test fill commitment");
+    ctx.set_account(
+        &ring,
+        &SolAccount {
+            lamports: account.lamports,
+            data,
+            owner: account.owner,
+            executable: account.executable,
+            rent_epoch: account.rent_epoch,
+        }
+        .into(),
+    );
+    ring
+}
+
 /// Drive a single settled `apply_fill`: taker buys `size_lots` @ `price_ticks`
 /// from maker. Both trader states must already exist & be funded. Returns the
 /// two position PDAs (taker, maker).
@@ -17478,6 +17582,22 @@ async fn apply_one_fill(
         market_pda.as_ref(),
         maker_state.as_ref(),
     ]);
+    let taker: TraderStateAccount = fetch(&mut ctx.banks_client, taker_state).await;
+    let maker: TraderStateAccount = fetch(&mut ctx.banks_client, maker_state).await;
+    let ring = seed_fill_commitment(
+        ctx,
+        payer,
+        market_pda,
+        to_sdk(taker.trader),
+        to_sdk(maker.trader),
+        0,
+        size_lots,
+        price_ticks,
+        0,
+        0,
+        false,
+    )
+    .await;
     let ix = build_ix(
         clober::instruction::ApplyFill {
             size_lots,
@@ -17501,6 +17621,7 @@ async fn apply_one_fill(
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(program_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(ring, false),
         ],
     );
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -17529,9 +17650,9 @@ async fn g3_oi_insurance_multiple_setter_bounds() {
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Default is 0 (disabled) fresh out of initialize_market.
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
-        m0.oi_insurance_multiple_bps, 0,
+        initial_market.oi_insurance_multiple_bps, 0,
         "breaker defaults to 0 (disabled)"
     );
 
@@ -17621,7 +17742,7 @@ async fn g3_oi_insurance_breaker_trips_and_pauses() {
         maker_state,
         1,       // size_lots
         100_000, // price_ticks == mark
-        2,       // fill_seq
+        1,       // first settlement sequence
     )
     .await;
 
@@ -17714,8 +17835,11 @@ async fn g3_oi_insurance_breaker_disabled_no_pause() {
     let book_pda = init_market_book_for(&mut ctx, &payer, market_pda).await;
 
     // Do NOT set the multiple: it stays 0 (disabled).
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
-    assert_eq!(m0.oi_insurance_multiple_bps, 0, "breaker left disabled");
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    assert_eq!(
+        initial_market.oi_insurance_multiple_bps, 0,
+        "breaker left disabled"
+    );
 
     // Even a tiny insurance balance would trip a 1× breaker on this fill — but the
     // breaker is off, so it must stay dormant.
@@ -17735,7 +17859,7 @@ async fn g3_oi_insurance_breaker_disabled_no_pause() {
         maker_state,
         1,
         100_000,
-        2,
+        1,
     )
     .await;
 
@@ -17827,9 +17951,9 @@ async fn g3_oi_insurance_floor_setter_bounds() {
     let (_protocol, market_pda, _, _, _) = setup_market(&mut ctx, &payer).await;
 
     // Default is 0 (no floor) fresh out of initialize_market.
-    let m0: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
+    let initial_market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
     assert_eq!(
-        m0.oi_insurance_floor_notional, 0,
+        initial_market.oi_insurance_floor_notional, 0,
         "floor defaults to 0 (no floor)"
     );
 
@@ -17882,7 +18006,7 @@ async fn g3_oi_insurance_floor_setter_bounds() {
     assert_eq!(m.oi_insurance_floor_notional, 0);
 }
 
-/// (5): the P3-4 BOOTSTRAP FLOOR. An ENABLED breaker (1×) with a near-empty
+/// Bootstrap safety floor: an enabled breaker (1×) with a near-empty
 /// insurance fund would auto-pause a fresh market on its very first fill — the cap
 /// `insurance · 1` collapses to ~0. The floor fixes this: with the floor set above
 /// the fill's gross OI notional, the SAME fill that trips a floorless 1× breaker
@@ -17926,7 +18050,7 @@ async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
         maker_state,
         1,
         100_000,
-        2,
+        1,
     )
     .await;
 
@@ -17999,7 +18123,7 @@ async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
         maker2_state,
         1,
         100_000,
-        3,
+        2,
     )
     .await;
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
@@ -18007,283 +18131,5 @@ async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
         market.status,
         clober::MarketStatus::Paused as u8,
         "once gross OI exceeds the (lowered) floor, the breaker still trips"
-    );
-}
-
-// ─── legacy LP-seed wedge migration ─────────────────────────────────────────
-//
-// The pool-singleton seed rename (`flp_exposure` → `lp_exposure`) left
-// pre-rename deployments with (a) an orphaned singleton at the retired PDA and
-// (b) a stranded treasury `LpPositionAccount` at the EXACT address
-// `initialize_liquidity_pool` must `init` — so the pool can never be
-// (re)initialized. `close_legacy_lp_accounts` clears both; it is admin-gated
-// and only legal while the canonical singleton does not exist.
-
-#[tokio::test]
-async fn legacy_lp_seed_wedge_migration_unblocks_pool_init() {
-    use solana_sdk::account::Account as SolAccount;
-
-    let pt = make_program_test();
-    let mut ctx = pt.start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let (insurance_fund, _) = pda(&[InsuranceFundAccount::SEED]);
-    let (lp_exposure, _) = pda(&[LiquidityPoolAccount::SEED]);
-    let (treasury_pos, treasury_bump) = pda(&[
-        clober::state::LpPositionAccount::SEED,
-        payer.pubkey().as_ref(),
-    ]);
-    let (legacy_flp, _) = pda(&[b"flp_exposure"]);
-
-    // Insurance fund init (authority = payer) — required by both the wedged
-    // pool init and the migration's admin gate.
-    let quote_mint = create_mint(&mut ctx, &payer).await;
-    let quote_vault = Keypair::new();
-    let ix = build_ix(
-        clober::instruction::InitializeInsuranceFund {
-            fee_contribution_bps: 1_000,
-            toxicity_tax_contribution_bps: 5_000,
-            liq_penalty_contribution_bps: 5_000,
-            pause_threshold_quote_lots: 5_000,
-        },
-        vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(insurance_fund, false),
-            AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new(quote_vault.pubkey(), true),
-            AccountMeta::new_readonly(spl_token_id(), false),
-            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-    );
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&payer.pubkey()),
-            &[&payer, &quote_vault],
-            bh,
-        ))
-        .await
-        .unwrap();
-
-    // Inject the pre-rename wreckage: a stranded treasury LpPositionAccount at
-    // the canonical treasury address, and an orphaned program-owned singleton
-    // at the retired `flp_exposure` PDA.
-    let inject_treasury = |lp: Pubkey, bump: u8| {
-        let state = clober::state::LpPositionAccount {
-            lp: to_anchor(lp),
-            bump,
-            shares: 42,
-            total_deposited_quote_lots: 42,
-            total_withdrawn_quote_lots: 0,
-            deposited_at_slot: 0,
-        };
-        let mut data = Vec::new();
-        state.try_serialize(&mut data).unwrap();
-        data.resize(104, 0);
-        data
-    };
-    let rent = solana_sdk::rent::Rent::default();
-    ctx.set_account(
-        &treasury_pos,
-        &SolAccount {
-            lamports: rent.minimum_balance(104),
-            data: inject_treasury(payer.pubkey(), treasury_bump),
-            owner: program_id(),
-            executable: false,
-            rent_epoch: 0,
-        }
-        .into(),
-    );
-    let legacy_flp_lamports = rent.minimum_balance(200);
-    ctx.set_account(
-        &legacy_flp,
-        &SolAccount {
-            lamports: legacy_flp_lamports,
-            data: vec![0xAB; 200],
-            owner: program_id(),
-            executable: false,
-            rent_epoch: 0,
-        }
-        .into(),
-    );
-
-    let (authority_lp_position, _) = pda(&[
-        clober::state::LpPositionAccount::SEED,
-        payer.pubkey().as_ref(),
-    ]);
-    let pool_init_ix = || {
-        build_ix(
-            clober::instruction::InitializeLiquidityPool {
-                initial_capital_quote_lots: 0,
-            },
-            vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(lp_exposure, false),
-                AccountMeta::new(authority_lp_position, false),
-                AccountMeta::new_readonly(insurance_fund, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-        )
-    };
-
-    // 1. Wedge reproduced: pool init fails while the stranded treasury
-    //    occupies the `init` address.
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let err = ctx
-        .banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[pool_init_ix()],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{err:?}").contains("Custom(0)"),
-        "wedged pool init must fail on create (account already in use), got: {err:?}"
-    );
-
-    // 2. Migration is admin-gated: a non-authority signer (with its own
-    //    injected stranded treasury, so the gate — not a missing account —
-    //    is what rejects) fails Unauthorized.
-    let rando = Keypair::new();
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[system_instruction::transfer(
-                &payer.pubkey(),
-                &rando.pubkey(),
-                1_000_000_000,
-            )],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap();
-    let (rando_pos, rando_bump) = pda(&[
-        clober::state::LpPositionAccount::SEED,
-        rando.pubkey().as_ref(),
-    ]);
-    ctx.set_account(
-        &rando_pos,
-        &SolAccount {
-            lamports: rent.minimum_balance(104),
-            data: inject_treasury(rando.pubkey(), rando_bump),
-            owner: program_id(),
-            executable: false,
-            rent_epoch: 0,
-        }
-        .into(),
-    );
-    let migrate_ix = |authority: Pubkey, treasury: Pubkey| {
-        build_ix(
-            clober::instruction::CloseLegacyLpAccounts {},
-            vec![
-                AccountMeta::new(authority, true),
-                AccountMeta::new_readonly(insurance_fund, false),
-                AccountMeta::new_readonly(lp_exposure, false),
-                AccountMeta::new(treasury, false),
-                AccountMeta::new(legacy_flp, false),
-            ],
-        )
-    };
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let err = ctx
-        .banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[migrate_ix(rando.pubkey(), rando_pos)],
-            Some(&rando.pubkey()),
-            &[&rando],
-            bh,
-        ))
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{err:?}").contains("Custom(7100)"),
-        "non-authority migration must fail Unauthorized, got: {err:?}"
-    );
-
-    // 3. Authority migration succeeds: both legacy accounts are gone and the
-    //    rent came back.
-    let balance_before = ctx.banks_client.get_balance(payer.pubkey()).await.unwrap();
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[migrate_ix(payer.pubkey(), treasury_pos)],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap();
-    assert!(
-        ctx.banks_client
-            .get_account(treasury_pos)
-            .await
-            .unwrap()
-            .is_none(),
-        "stranded treasury must be closed"
-    );
-    assert!(
-        ctx.banks_client
-            .get_account(legacy_flp)
-            .await
-            .unwrap()
-            .is_none(),
-        "orphaned pre-rename singleton must be reaped"
-    );
-    let balance_after = ctx.banks_client.get_balance(payer.pubkey()).await.unwrap();
-    assert!(
-        balance_after > balance_before,
-        "rent must be reclaimed to the authority (before={balance_before}, after={balance_after})"
-    );
-
-    // 4. The wedge is gone: pool init now succeeds and the endowment is
-    //    freshly written (not the injected legacy values).
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    ctx.banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[pool_init_ix()],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap();
-    let pool: LiquidityPoolAccount = fetch(&mut ctx.banks_client, lp_exposure).await;
-    assert_eq!(pool.authority, to_anchor(payer.pubkey()));
-    assert_eq!(pool.lp_shares_outstanding, 0);
-    let endowment: clober::state::LpPositionAccount =
-        fetch(&mut ctx.banks_client, authority_lp_position).await;
-    assert_eq!(endowment.shares, 0, "live endowment starts at zero shares");
-
-    // 5. SAFETY: once the pool is live, the same seeds address the LIVE
-    //    treasury endowment — the migration must refuse to close it.
-    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let err = ctx
-        .banks_client
-        .process_transaction(Transaction::new_signed_with_payer(
-            &[migrate_ix(payer.pubkey(), treasury_pos)],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{err:?}").contains("Custom(7101)"),
-        "migration after pool init must fail AlreadyInitialized, got: {err:?}"
-    );
-    assert!(
-        ctx.banks_client
-            .get_account(authority_lp_position)
-            .await
-            .unwrap()
-            .is_some(),
-        "live endowment must survive a migration attempt"
     );
 }

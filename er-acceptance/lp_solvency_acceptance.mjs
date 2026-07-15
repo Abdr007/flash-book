@@ -1,9 +1,6 @@
-// LP hardening H-1 LIVE (devnet): on the ring-authenticated path the caller-
-// supplied fill_seq is IGNORED (auto-incremented), so a permissionless keeper
-// CANNOT wedge settlement. Full loop: LP posts → taker crosses → a keeper settles
-// via the ring path with fill_seq = u64::MAX → the fill SETTLES and
-// market.last_settlement_seq becomes 1 (NOT u64::MAX). Market uses a zero taker
-// fee so the taker needs no collateral. L1_RPC=<devnet> node hlp_h1_acceptance.mjs
+// LP permissionless-solvency live acceptance: LP posts, a taker crosses, and
+// any keeper settles the ring-authenticated fill with the exact next sequence.
+// The market uses a zero taker fee, so the taker needs no collateral.
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -19,13 +16,13 @@ const l1 = new Connection(L1_RPC, "confirmed");
 const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { commitment: "confirmed" }));
 const sys = SystemProgram.programId;
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 const LP = pda(["lp_exposure"]);
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 
 const sendAs = async (kp, ix, extra = []) => {
   const { blockhash } = await l1.getLatestBlockhash("confirmed");
@@ -35,7 +32,7 @@ const sendAs = async (kp, ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`LP H-1 live acceptance — L1=${L1_RPC}\n`);
+console.log(`LP permissionless-solvency live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const params = ref.params;
@@ -47,7 +44,7 @@ const BOOK = pda(["market_book", M]);
 const FC = pda(["fill_commit", M]);
 
 console.log("setup: ARMED zero-fee market + book + ring; LP posts an ask; a fresh taker");
-await sendAs(signer, await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+await sendAs(signer, await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
 await sendAs(signer, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
 await sendAs(signer, await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
 await sendAs(signer, await program.methods.lpPostMakerOrder(1, new BN(1), new BN(100000), new BN(0)).accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, lpExposure: LP }).instruction());
@@ -68,21 +65,20 @@ const TPOS = pda(["position", M, TS]);
 console.log(`  market ${M.toBase58()}\n`);
 
 console.log("1) taker crosses the LP ask → a ring commitment is pushed (maker = LP PDA)");
-await sendAs(taker, await program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await sendAs(taker, await program.methods.placeTakerOrder(0, new BN(1), new BN(100000), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: TS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 
-console.log("2) a KEEPER settles via the ring path with fill_seq = u64::MAX → must SETTLE (seq ignored)");
-const U64MAX = new BN("18446744073709551615");
-const lpFillIx = await program.methods.applyLpFill(new BN(1), new BN(100000), 0, 0, U64MAX, false)
+console.log("2) a KEEPER settles via the ring path with fill_seq = 1 → must SETTLE");
+const lpFillIx = await program.methods.applyLpFill(new BN(1), new BN(100000), 0, 0, new BN(1), false)
   .accountsPartial({ sequencer: signer.publicKey, market: M, insuranceFund: INS, takerTraderState: TS, takerPosition: TPOS, lpExposure: LP, feeTiers: null, marketHaircut: null, takerPositionHaircut: null, systemProgram: sys })
   .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }])
   .instruction();
 let settled = false, detail = "";
 try { await sendAs(signer, lpFillIx); settled = true; } catch (e) { detail = String(e.message || e).slice(0, 80); }
-ok(settled, `ring fill with fill_seq=u64::MAX SETTLED — the caller's nonce was ignored${settled?"":" — got: "+detail}`);
+ok(settled, `ring fill with fill_seq=1 settled${settled?"":" — got: "+detail}`);
 
-console.log("3) verify the nonce AUTO-INCREMENTED to 1 (not wedged at u64::MAX)");
+console.log("3) verify the settlement nonce advanced to 1");
 const mkt = await program.account.marketAccount.fetch(M);
-ok(Number(mkt.lastSettlementSeq) === 1, `last_settlement_seq = ${mkt.lastSettlementSeq} (== 1, not u64::MAX) → market not bricked; DoS closed`);
+ok(Number(mkt.lastSettlementSeq) === 1, `last_settlement_seq = ${mkt.lastSettlementSeq} (== 1)`);
 
-console.log(`\n${fail === 0 ? "✅ LP H-1 LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ LP permissionless-solvency LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

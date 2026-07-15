@@ -37,7 +37,7 @@ pub const DEFAULT_VOLUME_WINDOW_SLOTS: u64 = 3_024_000;
 pub const MAX_POSITIONS_PER_TRADER: usize = 16;
 
 /// Max rungs a single `place_ladder_order` may place (4.3). Bounds the per-tx compute
-/// so a ladder can never exceed the CU budget; each rung is a full `place_limit_v2_core`.
+/// so a ladder can never exceed the CU budget; each rung is a full `place_limit_core`.
 pub const MAX_LADDER_LEVELS: u8 = 20;
 
 /// Maximum stress scenarios `assess_margin` accepts (enforced at entry).
@@ -87,12 +87,6 @@ pub const LP_SEQ_RESERVED_OFFSET: u64 = 1u64 << 56;
 /// Per-trader per-batch limit on submitted orders. Spam-protection.
 pub const MAX_ORDERS_PER_TRADER_PER_BATCH: u32 = 16;
 
-/// Solana account max size (10 MB). `migrate_market_layout` (and any
-/// other account-reallocing ix) MUST refuse `target_size` greater than
-/// this — otherwise the realloc panics deep in the runtime and burns
-/// the tx's compute budget without surfacing a useful error.
-pub const SOLANA_MAX_ACCOUNT_SIZE: usize = 10 * 1024 * 1024;
-
 /// Hard cap on legs in a single `place_basket_order_n` call. Bounded
 /// because remaining_accounts traversal is linear in legs and each leg
 /// costs ~3 account deserialisations + a buffer re-serialise. Production
@@ -132,7 +126,7 @@ pub const REDUCE_ONLY_TRIGGER_ORDER_TTL_SLOTS: u64 = 750;
 pub const PARAM_UPDATE_TIMELOCK_SECONDS: i64 = 48 * 60 * 60;
 
 /// sane bounds for the ONE change the immediate `update_market_params` path
-/// still permits — ENABLING a disabled (legacy, pre-bound-era) oracle-staleness
+/// still permits — ENABLING a disabled (default, pre-bound-era) oracle-staleness
 /// gate (`oracle_staleness_max_seconds == 0`). The new bound must land in
 /// `[MIN, MAX]`: the floor prevents an always-stale foot-gun (too-tight → every
 /// price reads stale), the ceiling prevents "enabling" the gate to a uselessly
@@ -293,21 +287,21 @@ pub const MAX_PRICE_SIG_FIGS: u32 = 5;
 /// calls. 64 comfortably fits a transaction's account/data budget.
 pub const MAX_REAP_PER_CALL: usize = 64;
 
-// ─── HIP-3 permissionless-market safety envelope ────────────────────────────
+// ─── Permissionless-market safety envelope ────────────────────────────
 // Hard bounds every `create_permissionless_market` param must satisfy, so a
 // market created by ANY signer is provably conservative regardless of intent.
-// (`validate_hip3_params` enforces these; `hip3_params_are_safe` proves it.)
+// (`validate_permissionless_market_params` enforces these; `permissionless_market_params_are_safe` proves it.)
 
 /// Max leverage a permissionless market may offer. The per-market maintenance
 /// floor (tied to the calibrated stress tier) is the binding constraint below
 /// this ceiling; a market only reaches high leverage when its stress tier AND
-/// its backstop coverage provably permit it (see `hip3_core_bounds_ok`,
+/// its backstop coverage provably permit it (see `permissionless_market_core_bounds_ok`,
 /// `worst_gap_loss_exceeds_insurance`).
-pub const HIP3_MAX_LEVERAGE: u32 = 65;
-/// Minimum maintenance-margin ratio (bps) for a LEGACY (un-tiered) market —
+pub const PERMISSIONLESS_MAX_LEVERAGE: u32 = 65;
+/// Minimum maintenance-margin ratio (bps) for a DEFAULT (un-tiered) market —
 /// `stress_shock_bps == 0`. Tiered markets use `max(stress_shock_bps,
-/// MIN_MM_ABS_BPS)` instead (see `hip3_core_bounds_ok`).
-pub const HIP3_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
+/// MIN_MM_ABS_BPS)` instead (see `permissionless_market_core_bounds_ok`).
+pub const PERMISSIONLESS_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
 
 /// ── Per-market calibrated-stress leverage tiers (Phase 1) ──────────────────
 /// Minimum per-market stress shock (bps) a market may calibrate to. 1.5% floor
@@ -316,33 +310,33 @@ pub const HIP3_MIN_MAINTENANCE_MARGIN_BPS: u32 = 500;
 /// is rejected by the setter.
 pub const MIN_STRESS_SHOCK_BPS: u32 = 150;
 /// The stress shock a market with `stress_shock_bps == 0` (never opted into a
-/// tier) is treated as — the legacy ±30% black swan. This is BOTH the default
+/// tier) is treated as — the default ±30% black swan. This is BOTH the default
 /// scenario-scaling shock (full 30% lattice, fail-safe) AND the default
 /// backstop tail. Selecting 0 is the safe off-switch.
-pub const LEGACY_STRESS_SHOCK_BPS: u32 = 3000;
+pub const BASELINE_STRESS_SHOCK_BPS: u32 = 3000;
 /// Absolute maintenance-margin floor (bps) for a TIERED market. Even the
 /// calmest calibrated tier must hold ≥ 0.25% maintenance, bounding the
 /// liquidation gap when the tier's own shock is tiny.
 pub const MIN_MM_ABS_BPS: u32 = 25;
 /// Max taker fee (bps). 1% cap — no predatory fee extraction.
-pub const HIP3_MAX_TAKER_FEE_BPS: u32 = 100;
+pub const PERMISSIONLESS_MAX_TAKER_FEE_BPS: u32 = 100;
 /// Max liquidation penalty + liquidator reward (bps). 10% cap.
-pub const HIP3_MAX_LIQ_BPS: u32 = 1_000;
+pub const PERMISSIONLESS_MAX_LIQ_BPS: u32 = 1_000;
 /// Max oracle staleness (seconds) — a permissionless market must consume a
 /// FRESH oracle; 120 s bounds mark drift feeding worse-of liquidations.
-pub const HIP3_MAX_ORACLE_STALENESS_SECS: u32 = 120;
+pub const PERMISSIONLESS_MAX_ORACLE_STALENESS_SECS: u32 = 120;
 /// Max any single fee-share (referrer/builder/creator), bps.
-pub const HIP3_MAX_SHARE_BPS: u32 = 2_000;
+pub const PERMISSIONLESS_MAX_SHARE_BPS: u32 = 2_000;
 /// Max funding charged over one funding period (bps of notional) a
 /// permissionless market may configure. 1% per period bounds the worst-case
 /// per-period value transfer a hostile creator can drive through the funding
 /// crank; enforced at the crank via `clamp_delta_to_period_cap`.
-pub const HIP3_MAX_FUNDING_PER_PERIOD_BPS: u32 = 100;
+pub const PERMISSIONLESS_MAX_FUNDING_PER_PERIOD_BPS: u32 = 100;
 /// Min / max funding period (seconds) for a permissionless market, so the
 /// pro-rated per-period cap is meaningful (not a degenerate 0-length or
 /// multi-week window).
-pub const HIP3_MIN_FUNDING_PERIOD_SECS: u32 = 60;
-pub const HIP3_MAX_FUNDING_PERIOD_SECS: u32 = 86_400;
+pub const PERMISSIONLESS_MIN_FUNDING_PERIOD_SECS: u32 = 60;
+pub const PERMISSIONLESS_MAX_FUNDING_PERIOD_SECS: u32 = 86_400;
 
 #[cfg(test)]
 mod oracle_band_tests {

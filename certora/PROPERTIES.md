@@ -106,7 +106,7 @@ decide at `/1e6`). A larger crowded book is never under-margined.
 position set; omitting/substituting/duplicating a position cannot lower required
 margin.
 → **`[REQUIRE]`** `verify_position_pda` + exact-count + dedupe + `size>0` on
-`partial_withdraw_collateral` / `sweep_collateral` / `liquidate_portfolio_v2`;
+`partial_withdraw_collateral` / `sweep_collateral` / `liquidate_portfolio`;
 **`[CERTORA-TARGET]`** prove the walk is exhaustive vs. the trader's on-chain
 position set.
 
@@ -114,11 +114,11 @@ position set.
 
 ## 4. Settlement integrity
 
-**P-SETTLE-1 — No replay.** Each settlement carries a `fill_seq` strictly greater
-than `market.last_settlement_seq`, which it then advances atomically; a replayed
-or out-of-order settlement reverts the whole transaction.
+**P-SETTLE-1 — No replay or gap.** Each settlement carries exactly
+`market.last_settlement_seq + 1`, which it then advances atomically; a replayed,
+out-of-order, or skipped settlement reverts the whole transaction.
 → **`[KANI]`** `advance_settlement_seq` (`matcher::fill_commitment`) —
-`nonce_rejects_non_increasing`, `nonce_advance_is_strict_and_exact`,
+`nonce_rejects_non_next_value`, `nonce_advance_is_exactly_next`,
 `nonce_chain_strictly_monotone`. Both `apply_fill` and `apply_lp_fill` route
 through the proven helper.
 
@@ -141,12 +141,12 @@ refused when the oracle is stale, and the EMA mark is clamped into the oracle ba
 → **`[KANI]`** worse-of core: `worse_of_health_price` (`matcher::liquidation`) —
 `health_price_worse_for_{long,short}` (always the worse of the two real sources,
 never under-states risk), `health_price_is_a_real_source` (never a fabricated
-price); `liquidate_position_v2` routes through it. **`[REQUIRE]`** staleness gate +
+price); `liquidate_position` routes through it. **`[REQUIRE]`** staleness gate +
 band clamp (byte-identical, no gap). **`[CERTORA-TARGET]`** the fully-combined gate.
 
 **P-LIQ-2 — No duplicate liquidation.** No second synthetic close order is
 injected (and no second reward paid) while one for the same position rests.
-→ **`[REQUIRE]`** book scan in `liquidate_position_v2` *and* `liquidate_portfolio_v2`.
+→ **`[REQUIRE]`** book scan in `liquidate_position` *and* `liquidate_portfolio`.
 
 ---
 
@@ -156,7 +156,7 @@ injected (and no second reward paid) while one for the same position rests.
 `order_id`, so the encoding alone must yield correct price-time priority on both
 books: a better price always sorts first (asks ascending, bids descending), and at
 equal price the earlier `seq` sorts first (FIFO, both sides).
-→ **`[KANI]`** `encode_order_id` (`state_v2`) — `ask_lower_price_fills_first`,
+→ **`[KANI]`** `encode_order_id` (`book_state`) — `ask_lower_price_fills_first`,
 `bid_higher_price_fills_first`, `earlier_seq_fills_first_at_same_price` (rules out
 the old LIFO-bid bug). Inputs in the encodable range (placement-enforced).
 

@@ -1,8 +1,8 @@
 // LP mode-lock live acceptance (F-4). Run AFTER `solana program deploy`.
 //   L1_RPC=<devnet> node lp_mode_lock_acceptance.mjs
-// Proves on-chain that the singleton and per-market v3 LP systems are mutually
+// Proves on-chain that the singleton and per-market LP systems are mutually
 // exclusive on minting LP shares: a singleton deposit claims MODE_SINGLETON,
-// after which a v3 deposit fails closed with LpSystemModeConflict.
+// after which a native deposit fails closed with LpSystemModeConflict.
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -24,12 +24,12 @@ const pda = (s, p = PID) =>
     p,
   )[0];
 
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 const LP = pda(["lp_exposure"]);
 const LP_MODE = pda(["lp_mode"]);
 const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -123,28 +123,28 @@ try {
 const mode = await program.account.lpModeAccount.fetch(LP_MODE);
 ok(mode.mode === 1, `lp_mode.mode == 1 (singleton), got ${mode.mode}`);
 
-// ── Negative: a v3 deposit is rejected by the lock ───────────────────────────
-// Reuse the existing REF_MARKET; init its v3 pool if absent (tolerant of an
+// ── Negative: a native deposit is rejected by the lock ───────────────────────────
+// Reuse the existing REF_MARKET; init its per-market pool if absent (tolerant of an
 // already-initialized pool from a prior run).
 const M = REF_MARKET;
 const EXP = pda(["lp_per_market", M]);
 try {
   await send(
     await program.methods
-      .initLpPerMarketV3()
+      .initLpPerMarket()
       .accountsPartial({ authority: signer.publicKey, insuranceFund: INS, market: M, exposure: EXP, systemProgram: sys })
       .instruction(),
   );
 } catch (e) {
   // already initialized — fine
 }
-const POS = pda(["lp_position_v3", EXP, signer.publicKey]);
+const POS = pda(["lp_position", EXP, signer.publicKey]);
 let rejErr = "";
 let rejected = false;
 try {
   await send(
     await program.methods
-      .lpDepositV3(new BN(1_000_000))
+      .lpMarketDeposit(new BN(1_000_000))
       .accountsPartial({
         lp: signer.publicKey,
         exposure: EXP,
@@ -165,7 +165,7 @@ try {
 }
 ok(
   rejected && (rejErr.includes("LpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")),
-  `v3 lp_deposit_v3 REJECTED with LpSystemModeConflict while singleton active${rejected ? "" : " (NOT rejected!)"}`,
+  `native lp_market_deposit REJECTED with LpSystemModeConflict while singleton active${rejected ? "" : " (NOT rejected!)"}`,
 );
 if (rejected && !(rejErr.includes("LpSystemModeConflict") || rejErr.includes("8321") || rejErr.includes("0x2081")))
   console.log("    (rejected but with unexpected error:", rejErr.slice(0, 400), ")");

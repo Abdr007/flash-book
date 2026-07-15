@@ -26,7 +26,7 @@ abbrev Pubkey := Nat  -- vestigial: the conservation bound does not depend on it
 structure State where
   credited : Nat
 
-def convertTransition (s : State) (signer : Pubkey) (matured : Nat) (h : Nat) : Option State :=
+def convertTransition (s : State) (_signer : Pubkey) (matured : Nat) (h : Nat) : Option State :=
   if h ≤ 1000000000 then
     some { s with credited := (haircut_credit (matured) (h)) }
   else none

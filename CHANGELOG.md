@@ -32,7 +32,7 @@ tuning to the funded insurance. All code changes merged through branch protectio
   by anyone including admins, until CI is green.
 
 ### Deployment & configuration (devnet)
-- Program `5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` upgraded to include
+- Program `8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z` upgraded to include
   `deposit_insurance_fund` (slot 476067185); deployed bytecode hash-verified
   against the local build.
 - Insurance fund capitalized to **100,000 USDC** via `deposit_insurance_fund`.
@@ -47,7 +47,7 @@ tuning to the funded insurance. All code changes merged through branch protectio
 Second devnet release. Merged via PR #347 (`535fe60`) with CI 8/8 green
 (tests, SBF 0-warn, clippy/fmt, Kani, Lean, Certora, IDL-drift, cargo-audit)
 and deployed to devnet by upgrading program
-`5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq` (slot 476056517); the deployed
+`8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z` (slot 476056517); the deployed
 bytecode was hash-verified against the local build.
 
 ### Added

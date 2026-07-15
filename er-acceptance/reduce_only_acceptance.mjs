@@ -31,14 +31,14 @@ const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffe
 const FLAG_REDUCE_ONLY = 2;
 const STATUS_CLOSE_ONLY = 5;
 
-// Reference devnet accounts (shared across the acceptance suite).
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+// Current-program devnet fixture shared across the acceptance suite.
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 const LP = pda(["lp_exposure"]);
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 
 const traderStatePda = (trader, sub = 0) =>
   sub === 0 ? pda(["trader_state", trader]) : pda(["trader_state", trader, Buffer.from([sub])]);
@@ -85,11 +85,11 @@ if (!(await l1.getAccountInfo(TS0))) {
 ok(!!(await l1.getAccountInfo(TS0)), `TraderState(sub 0) exists ${TS0.toBase58().slice(0, 8)}…`);
 
 const takerBuilder = (flags, { position = null } = {}) =>
-  program.methods.placeTakerOrderV2(0, new BN(1), new BN(100000), flags, new BN(0), 0)
+  program.methods.placeTakerOrder(0, new BN(1), new BN(100000), flags, new BN(0), 0)
     .accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: TS0, position })
     .remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]);
 const limitBuilder = (flags) =>
-  program.methods.placeLimitOrderV2(0, new BN(1), new BN(100000), flags, new BN(0), 0)
+  program.methods.placeLimitOrder(0, new BN(1), new BN(100000), flags, new BN(0), 0)
     .accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: TS0, position: null });
 
 // ── NEG-1: reduce-only taker, no position → ReduceOnlyNoPosition ───────────────

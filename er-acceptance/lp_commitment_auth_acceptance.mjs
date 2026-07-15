@@ -1,7 +1,7 @@
-// LP hardening H-2 LIVE (devnet): on an ARMED market, apply_lp_fill via the
+// LP hardening commitment-authentication LIVE (devnet): on an ARMED market, apply_lp_fill via the
 // SEQUENCER path with NO fill-commitment must be REJECTED (Unauthorized) — the
 // ring is mandatory. This is the closed sequencer-LP-fabrication channel, on the
-// real chain. (The ring path itself is exercised by hlp_acceptance.mjs.)
+// real chain. (The ring path itself is exercised by liquidity_pool_acceptance.mjs.)
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -16,13 +16,13 @@ const l1 = new Connection(L1_RPC, "confirmed");
 const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { commitment: "confirmed" }));
 const sys = SystemProgram.programId;
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 const LP = pda(["lp_exposure"]);
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 
 const sendAs = async (kp, ix, extra = []) => {
   const { blockhash } = await l1.getLatestBlockhash("confirmed");
@@ -32,7 +32,7 @@ const sendAs = async (kp, ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`LP H-2 live acceptance — L1=${L1_RPC}\n`);
+console.log(`LP commitment-authentication live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const base = Keypair.generate();
@@ -41,7 +41,7 @@ const BOOK = pda(["market_book", M]);
 const FC = pda(["fill_commit", M]);
 
 console.log("setup: ARMED market + book + ring; a fresh taker trader-state");
-await sendAs(signer, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+await sendAs(signer, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
 await sendAs(signer, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
 await sendAs(signer, await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction()); // ARMS the market
 const taker = Keypair.generate();
@@ -65,11 +65,11 @@ try {
   detail = String(e.message || e).slice(0, 60);
   if (!rejected) { const m = String(e.message||e).match(/Transaction\s+([1-9A-HJ-NP-Za-km-z]{40,})/); if (m) { try { const t = await l1.getTransaction(m[1], {maxSupportedTransactionVersion:0, commitment:"confirmed"}); rejected = /0x1bbc|Unauthorized|7100/i.test((t?.meta?.logMessages||[]).join(" ")); } catch {} } }
 }
-ok(rejected, `armed market REJECTS the sequencer LP path without a ring (H-2: fabrication channel closed)${rejected?"":" — got: "+detail}`);
+ok(rejected, `armed market REJECTS the sequencer LP path without a ring (commitment-authentication: fabrication channel closed)${rejected?"":" — got: "+detail}`);
 
 // position must NOT have been created
 const posAcct = await l1.getAccountInfo(TPOS);
 ok(posAcct === null, "no taker position created — the fabricated fill was rejected before settlement");
 
-console.log(`\n${fail === 0 ? "✅ LP H-2 LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ LP commitment-authentication LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -16,7 +16,7 @@
 //
 // Usage:
 //   node scripts/verify_k1_authority.mjs \
-//     --program 5VqBguVaSj8PH6BTk9X5s3nJCHRqAkZfB7G7Bjenzcq \
+//     --program 8Vdd5n4zbmxqwqY8Xv8JbEcvbih3JsEZzJBtfkoeGp2z \
 //     --multisig <SQUADS_VAULT_PDA> \
 //     --markets <MARKET_PDA>[,<MARKET_PDA>...] \
 //     [--insurance <INSURANCE_FUND_PDA>] [--url <RPC>] [--immutable]

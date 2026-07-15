@@ -1,10 +1,10 @@
 Clober — third-party components & modification notices
 ==========================================================
 
-This product includes software developed by third parties. First-party Flash
-Book code is licensed MIT (see LICENSE). The compiled on-chain program links the
+This product includes software developed by third parties. First-party Clober
+code is licensed MIT (see LICENSE). The compiled on-chain program links the
 GPL-3.0-only component below and is therefore distributed under GPL-3.0-only as a
-combined work; see docs/LICENSE_ANALYSIS.md.
+combined work.
 
 ------------------------------------------------------------------------------
 programs/clober/src/hypertree/

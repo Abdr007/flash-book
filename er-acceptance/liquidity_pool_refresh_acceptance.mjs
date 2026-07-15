@@ -1,4 +1,4 @@
-// HLP increment 2 LIVE acceptance: the pool auto-quotes.
+// Liquidity-pool live acceptance: the pool auto-quotes.
 //   1. fresh armed market (LOW oracle so the ~8M global LP capital yields
 //      non-zero per-level size) + book + ring
 //   2. lp_refresh_quotes -> the pool posts a deterministic two-sided ladder
@@ -19,13 +19,13 @@ const l1 = new Connection(L1_RPC, "confirmed");
 const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { commitment: "confirmed" }));
 const sys = SystemProgram.programId;
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 const LP = pda(["lp_exposure"]);
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 
 const send = async (ix, extra = []) => {
   const { blockhash } = await l1.getLatestBlockhash("confirmed");
@@ -35,7 +35,7 @@ const send = async (ix, extra = []) => {
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { fail++; console.log("  ✗ FAIL:", m); } };
 
-console.log(`HLP increment-2 (auto-quoter) live acceptance — L1=${L1_RPC}\n`);
+console.log(`liquidity pool increment-2 (auto-quoter) live acceptance — L1=${L1_RPC}\n`);
 const ref = await program.account.marketAccount.fetch(REF_MARKET);
 if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60; // ref market predates the init-time staleness bound
 const ORACLE = 1000; // low so the ~8M global LP capital yields non-zero levels
@@ -45,7 +45,7 @@ const BOOK = pda(["market_book", M]);
 const FC = pda(["fill_commit", M]);
 
 console.log("setup: armed market (oracle=1000) + book + ring");
-await send(await program.methods.initializeMarket(ref.params, new BN(ORACLE)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+await send(await program.methods.initializeMarket(ref.params, new BN(ORACLE)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
 await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
 await send(await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
 console.log(`  market ${M.toBase58()}\n`);
@@ -57,7 +57,7 @@ const sig1 = await send(await program.methods.lpRefreshQuotes().accountsPartial(
 ok(!!sig1, `pool posted its on-book quote ladder LIVE — ${sig1.slice(0, 16)}…`);
 
 console.log("2) taker crosses the pool's best ask (bid 10× oracle to guarantee a cross)");
-await send(await program.methods.placeTakerOrderV2(0, new BN(1), new BN(ORACLE * 10), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
+await send(await program.methods.placeTakerOrder(0, new BN(1), new BN(ORACLE * 10), 0, new BN(0), 0).accountsPartial({ trader: signer.publicKey, market: M, marketBook: BOOK, traderState: pda(["trader_state", signer.publicKey]), position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }]).instruction());
 const r = await ring();
 ok(r.produced >= 1, `a taker crossed an AUTO-QUOTED LP level → ring-committed LP-maker fill (produced=${r.produced})`);
 
@@ -68,5 +68,5 @@ await new Promise((r) => setTimeout(r, 25_000));
 const sig3 = await send(await program.methods.lpRefreshQuotes().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, lpExposure: LP }).instruction());
 ok(!!sig3, `pool re-quoted (cancel stale + repost) LIVE — ${sig3.slice(0, 16)}…`);
 
-console.log(`\n${fail === 0 ? "✅ HLP AUTO-QUOTER LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
+console.log(`\n${fail === 0 ? "✅ liquidity pool AUTO-QUOTER LIVE ACCEPTANCE PASSED" : "❌ FAILED"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

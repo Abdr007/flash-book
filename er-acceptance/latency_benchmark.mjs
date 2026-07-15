@@ -1,7 +1,7 @@
 // ── Track B — MagicBlock ER fill-latency benchmark (devnet, reproduced) ──────────
 //
 // Measures the CLIENT-OBSERVED round-trip of a REAL taker fill on the MagicBlock ER:
-// build placeTakerOrderV2 → sendRawTransaction to the ER validator → confirm. Reuses
+// build placeTakerOrder → sendRawTransaction to the ER validator → confirm. Reuses
 // the proven er_acceptance genesis (init market + book/ring/outbox, delegate to the
 // ER, fund maker+taker, ER margin attestations), then loops rest-bid → timed-taker.
 //
@@ -42,12 +42,12 @@ const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 const ata = (owner, mint) => PublicKey.findProgramAddressSync([owner.toBuffer(), TOKEN_PROGRAM.toBuffer(), mint.toBuffer()], ATA_PROGRAM)[0];
 const createAtaIx = (payer, owner, mint) => new anchor.web3.TransactionInstruction({ programId: ATA_PROGRAM, keys: [ { pubkey: payer, isSigner: true, isWritable: true }, { pubkey: ata(owner, mint), isSigner: false, isWritable: true }, { pubkey: owner, isSigner: false, isWritable: false }, { pubkey: mint, isSigner: false, isWritable: false }, { pubkey: sys, isSigner: false, isWritable: false }, { pubkey: TOKEN_PROGRAM, isSigner: false, isWritable: false } ], data: Buffer.from([1]) });
 const transferIx = (from, to, authority, amount) => { const d = Buffer.alloc(9); d.writeUInt8(3, 0); d.writeBigUInt64LE(BigInt(amount), 1); return new anchor.web3.TransactionInstruction({ programId: TOKEN_PROGRAM, keys: [ { pubkey: from, isSigner: false, isWritable: true }, { pubkey: to, isSigner: false, isWritable: true }, { pubkey: authority, isSigner: true, isWritable: false } ], data: d }); };
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 
 const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))));
 const l1 = new Connection(L1_RPC, "confirmed");
@@ -100,7 +100,7 @@ try {
   const ref = await program.account.marketAccount.fetch(REF_MARKET);
   if (!ref.params.oracleStalenessMaxSeconds) ref.params.oracleStalenessMaxSeconds = 60;
   console.log("genesis: init market + delegate to ER …", M.toBase58());
-  await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+  await send(l1, await program.methods.initializeMarket(ref.params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
   await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction(), []);
   await send(l1, await program.methods.initFillCommitment(CAP).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction(), []);
   await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction(), []);
@@ -134,10 +134,10 @@ try {
   const total = SAMPLES + WARMUP;
   for (let i = 0; i < total; i++) {
     const tick = 90000 - (i % 80) * 10;
-    await send(er, await program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
+    await send(er, await program.methods.placeLimitOrder(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: M, marketBook: BOOK, traderState: makerTS, position: null }).instruction(), [maker]);
     // Time ONLY the successful send attempt (429 backoff happens between attempts,
     // outside the measured window), so the distribution reflects clean round-trips.
-    const takerIx = await program.methods.placeTakerOrderV2(1, new BN(1), new BN(1), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction();
+    const takerIx = await program.methods.placeTakerOrder(1, new BN(1), new BN(1), 0, new BN(0), 0).accountsPartial({ trader: taker.publicKey, market: M, marketBook: BOOK, traderState: takerTS, position: null }).remainingAccounts([{ pubkey: FC, isWritable: true, isSigner: false }, { pubkey: FO, isWritable: true, isSigner: false }]).instruction();
     let sig, ms;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -164,14 +164,14 @@ try {
     if (i % 5 === 0 || !warm) console.log(`  #${i}${warm ? "" : " (warmup)"}  ${ms.toFixed(1)} ms  cu=${cu ?? "?"}  ${sig.slice(0, 12)}…`);
     await sleep(400); // pacing to stay under the public ER endpoint rate limit
   }
-  const m2 = rows.filter((r) => r.warm).map((r) => r.ms);
+  const warm_samples = rows.filter((r) => r.warm).map((r) => r.ms);
   const cus = rows.filter((r) => r.warm && r.cu != null).map((r) => r.cu);
-  const mean = m2.reduce((a, x) => a + x, 0) / m2.length;
+  const mean = warm_samples.reduce((a, x) => a + x, 0) / warm_samples.length;
   const report = {
     endpoint: ER_RPC, validator: ER_VALIDATOR.toBase58(), market: M.toBase58(),
-    method: "client performance.now() around placeTakerOrderV2 send->confirm('confirmed') on the ER; INCLUDES client<->ER network RTT (upper bound on ER execution)",
-    samples: m2.length, warmup: WARMUP,
-    latency_ms: { p50: +pct(m2, 50).toFixed(2), p90: +pct(m2, 90).toFixed(2), p95: +pct(m2, 95).toFixed(2), p99: +pct(m2, 99).toFixed(2), min: +Math.min(...m2).toFixed(2), max: +Math.max(...m2).toFixed(2), mean: +mean.toFixed(2) },
+    method: "client performance.now() around placeTakerOrder send->confirm('confirmed') on the ER; INCLUDES client<->ER network RTT (upper bound on ER execution)",
+    samples: warm_samples.length, warmup: WARMUP,
+    latency_ms: { p50: +pct(warm_samples, 50).toFixed(2), p90: +pct(warm_samples, 90).toFixed(2), p95: +pct(warm_samples, 95).toFixed(2), p99: +pct(warm_samples, 99).toFixed(2), min: +Math.min(...warm_samples).toFixed(2), max: +Math.max(...warm_samples).toFixed(2), mean: +mean.toFixed(2) },
     compute_units: cus.length ? { min: Math.min(...cus), max: Math.max(...cus), median: pct(cus, 50) } : null,
     raw: rows,
   };

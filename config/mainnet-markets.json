@@ -1,0 +1,93 @@
+{
+  "schema": "clober.mainnet-market-catalog",
+  "schemaVersion": 1,
+  "network": "mainnet-beta",
+  "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "quoteSymbol": "USDC",
+  "oracle": {
+    "provider": "pyth",
+    "receiverProgram": "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+    "maxStalenessSeconds": 30,
+    "maxConfidenceBps": 100,
+    "tickDecimals": 3
+  },
+  "markets": [
+    {
+      "symbol": "BTC-PERP",
+      "baseMint": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+      "baseDecimals": 8,
+      "pythFeedId": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+      "riskProfile": "major",
+      "initialMarginBps": 1000,
+      "maintenanceMarginBps": 625,
+      "maxLeverage": 10,
+      "oracleBandBps": 300
+    },
+    {
+      "symbol": "ETH-PERP",
+      "baseMint": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+      "baseDecimals": 8,
+      "pythFeedId": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+      "riskProfile": "major",
+      "initialMarginBps": 1000,
+      "maintenanceMarginBps": 625,
+      "maxLeverage": 10,
+      "oracleBandBps": 350
+    },
+    {
+      "symbol": "SOL-PERP",
+      "baseMint": "So11111111111111111111111111111111111111112",
+      "baseDecimals": 9,
+      "pythFeedId": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+      "riskProfile": "major",
+      "initialMarginBps": 1250,
+      "maintenanceMarginBps": 750,
+      "maxLeverage": 8,
+      "oracleBandBps": 400
+    },
+    {
+      "symbol": "JUP-PERP",
+      "baseMint": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+      "baseDecimals": 6,
+      "pythFeedId": "0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996",
+      "riskProfile": "liquid-alt",
+      "initialMarginBps": 2000,
+      "maintenanceMarginBps": 1250,
+      "maxLeverage": 5,
+      "oracleBandBps": 700
+    },
+    {
+      "symbol": "PYTH-PERP",
+      "baseMint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+      "baseDecimals": 6,
+      "pythFeedId": "0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d06719579ff",
+      "riskProfile": "liquid-alt",
+      "initialMarginBps": 2500,
+      "maintenanceMarginBps": 1500,
+      "maxLeverage": 4,
+      "oracleBandBps": 800
+    },
+    {
+      "symbol": "RAY-PERP",
+      "baseMint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+      "baseDecimals": 6,
+      "pythFeedId": "91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a",
+      "riskProfile": "liquid-alt",
+      "initialMarginBps": 2500,
+      "maintenanceMarginBps": 1500,
+      "maxLeverage": 4,
+      "oracleBandBps": 800
+    },
+    {
+      "symbol": "BONK-PERP",
+      "baseMint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+      "baseDecimals": 5,
+      "pythFeedId": "72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419",
+      "riskProfile": "liquid-alt",
+      "initialMarginBps": 3334,
+      "maintenanceMarginBps": 2000,
+      "maxLeverage": 2,
+      "oracleBandBps": 1000
+    }
+  ]
+}

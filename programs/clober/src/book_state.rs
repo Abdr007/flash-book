@@ -1,4 +1,4 @@
-//! V2 account types — the orderbook over a hypertree slab.
+//! Orderbook account types — the orderbook over a hypertree slab.
 //!
 //! The slab layout keeps every book operation off the 4 KB BPF stack
 //! (a Borsh-deserialized book struct would not fit):

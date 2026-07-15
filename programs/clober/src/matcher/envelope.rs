@@ -81,7 +81,7 @@ impl Default for EnvelopeParams {
         //   price_budget = price_cap × dt = 14 bps × 100 = 1400 bps = 14%
         //   maintenance  = 3000 bps = 30%
         //   ratio = 0.467 + fee_term ≈ 0.473 ≤ 1.0 ✓
-        // Matches the v3 default `max_price_move_bps_per_slot=14`.
+        // Matches the per-market default `max_price_move_bps_per_slot=14`.
         // Per-market override at init.
         Self {
             max_price_move_bps_per_slot: 14, // 0.14% per slot ≈ 0.35%/sec

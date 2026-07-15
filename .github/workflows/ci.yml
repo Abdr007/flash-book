@@ -127,16 +127,17 @@ jobs:
         with:
           tool: cargo-audit
       - name: cargo audit
-        run: cargo audit
+        run: cargo audit --deny warnings
 
   idl-drift:
     name: IDL drift gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned to the toolchain the committed IDL was generated with, so
-      # `anchor idl build` is reproducible run-to-run.
-      - uses: dtolnay/rust-toolchain@1.89.0
+      # AVM's locked dependency graph requires Rust 1.91 or newer. This is the
+      # host compiler for the reproducible IDL generator only; SBF is pinned
+      # separately in its build commands.
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       # anchor-cli links against libudev (via hidapi); the runner needs the dev
       # package + pkg-config before `cargo install`.
@@ -146,8 +147,10 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-      - name: Install Anchor CLI
-        run: cargo install anchor-cli --version 0.32.1 --locked
+      - name: Install Anchor Version Manager
+        run: cargo install --git https://github.com/coral-xyz/anchor avm --locked
+      - name: Install matching Anchor CLI
+        run: avm install 1.1.2
       # Rebuild the IDL from source and fail if it diverges from the committed
       # idl/clober.json (the documented source of truth). Catches any account
       # / arg / discriminator / event / error change that was not regenerated.
@@ -155,6 +158,19 @@ jobs:
         run: anchor idl build -o /tmp/fresh-idl.json
       - name: Compare against committed IDL
         run: node scripts/check-idl-drift.mjs idl/clober.json /tmp/fresh-idl.json
+
+  market-catalog:
+    name: Mainnet market catalog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Validate release configuration and documentation
+        run: |
+          node scripts/validate-market-catalog.mjs
+          node scripts/validate-markdown.mjs
 
   lean:
     name: Formal verification (Lean)

@@ -2,15 +2,14 @@
 //! LP per-market state, oracle configs, and the risk/haircut siblings.
 //! All types live under the `clober` program ID; PDAs use distinct
 //! seed prefixes (`trigger`, `vault`, etc.) so they coexist
-//! alongside the v1/v2 types without seed collision.
+//! alongside the core market-account types without seed collision.
 
 use anchor_lang::prelude::*;
 
-// ─── Trigger orders v3 ──────────────────────────────────────────────
+// ─── Trigger orders ─────────────────────────────────────────────────────────────
 
 /// Trigger order. Seeds: `[b"trigger", market, trader, trigger_id]`.
-/// Distinct from the v1 `[b"trigger", ...]` prefix so both PDA families
-/// can coexist without collision.
+/// Uses a dedicated PDA prefix to avoid collisions with other account families.
 #[account]
 #[derive(Debug)]
 pub struct TriggerOrderAccount {
@@ -48,7 +47,7 @@ pub struct TriggerOrderAccount {
     ///
     /// On refusal, the trigger DEACTIVATES (so it doesn't re-fire next
     /// slot at the same gapped price) and emits
-    /// `TriggerOrderV3SlippageCancelledEvent`. The trader can re-place
+    /// `TriggerOrderSlippageCancelledEvent`. The trader can re-place
     /// with updated params if they still want to act.
     pub acceptable_price_ticks: u64,
     /// OCO link. For a bracket leg, this holds the sibling leg's
@@ -147,7 +146,7 @@ impl TwapOrderAccount {
         // body = 32+32 + 4×u8 + 8×u64 + 1 sub + 8 acceptable + 7 reserved
         //      = 64+4+64+1+8+7 = 148. An undercounted body here fails a
         // populated account with AccountDidNotSerialize, so the exact
-        // length is pinned by `twap_v3_space_matches_borsh_serialized_len`.
+        // length is pinned by `twap_space_matches_borsh_serialized_len`.
         8 + 148
     }
 }
@@ -183,7 +182,7 @@ impl IcebergOrderAccount {
     }
 }
 
-// ─── Vaults v3 ──────────────────────────────────────────────────────
+// ─── Vaults ─────────────────────────────────────────────────────────────────────
 
 /// Vault account. Seeds: `[b"vault", strategist, vault_id]`.
 #[account]
@@ -229,7 +228,7 @@ impl VaultPositionAccount {
     }
 }
 
-// ─── Per-market LP v3 ──────────────────────────────────────────────
+// ─── Per-market LP ─────────────────────────────────────────────────────────────
 
 /// Per-market LP exposure. Replaces the singleton's per_market[] array
 /// for independent ER-delegation per market.
@@ -282,7 +281,7 @@ const _: () = assert!(
     "LpMarketPositionAccount exceeds its reserved account data"
 );
 
-// ─── JIT liquidation offers v3 ──────────────────────────────────────
+// ─── JIT liquidation offers ─────────────────────────────────────────────────────
 //
 // A *maker* can pre-commit a "tighter than synthetic" close price to be
 // used WHEN any underwater trader is liquidated on this market. When
@@ -292,9 +291,8 @@ const _: () = assert!(
 // collateral; the insurance fund draws LESS; the maker gets a
 // guaranteed fill at a price they pre-committed.
 //
-// NO other on-chain DEX has this primitive — HL has private liquidations,
-// Drift / dYdX use external keepers + insurance. JIT auctions = public
-// pre-commit primitive where any maker can underbid the synthetic.
+// This primitive keeps liquidation participation public and lets any maker
+// pre-commit an offer that can underbid the synthetic order.
 //
 // Seeds: `[b"jit_liq_offer", market, maker, &nonce.to_le_bytes()]`.
 // `nonce` is a u32 the maker picks so they can have multiple concurrent
@@ -540,8 +538,7 @@ pub struct BatchAttestation {
     pub market: Pubkey,
     pub bump: u8,
     pub _pad0: [u8; 7],
-    /// Strictly-increasing committed batch sequence (replay/reorder guard — the
-    /// batch analog of the per-fill `advance_settlement_seq`).
+    /// Strictly-increasing committed batch sequence (replay/reorder guard).
     pub last_batch_seq: u64,
     /// Committee epoch of the last accepted batch.
     pub epoch: u64,
@@ -963,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_offer_pda_seed_distinct_from_v3_others() {
+    fn jit_offer_pda_seed_distinct_from_extended_orders() {
         // Confirm the JIT seed prefix doesn't collide with any sibling seed
         // (regression: someone reusing `trigger` etc).
         let jit = JitLiquidationOfferAccount::SEED;
@@ -985,7 +982,7 @@ mod tests {
     /// this pins the EXACT serialized length so any future field addition
     /// that desyncs `space()` fails loudly.
     #[test]
-    fn twap_v3_space_matches_borsh_serialized_len() {
+    fn twap_space_matches_borsh_serialized_len() {
         use anchor_lang::AnchorSerialize;
         let acc = TwapOrderAccount {
             trader: Pubkey::new_unique(),

@@ -882,7 +882,7 @@ pub(crate) enum Color {
 }
 unsafe impl Zeroable for Color {
     fn zeroed() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self::Black
     }
 }
 

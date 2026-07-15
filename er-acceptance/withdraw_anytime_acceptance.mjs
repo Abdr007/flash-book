@@ -23,8 +23,8 @@
 //     node er-acceptance/withdraw_anytime_acceptance.mjs
 //
 // Requires: a funded keypair at ~/.config/solana/id.json that is the market
-// authority (and doubles as the margin attestor here), and the program
-// deployed (5VqBgu…) on the target cluster.
+// authority (and doubles as the margin attestor here), and the program address
+// declared by the checked-out IDL deployed on the target cluster.
 import fs from "fs";
 import os from "os";
 import anchor from "@coral-xyz/anchor";
@@ -76,12 +76,12 @@ const transferIx = (from, to, authority, amount) => {
     data: d,
   });
 };
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 
 const signer = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(`${os.homedir()}/.config/solana/id.json`))));
 const l1 = new Connection(L1_RPC, "confirmed");
@@ -177,7 +177,7 @@ async function buildMarket(refParams) {
   const BOOK = pda(["market_book", M]);
   const FC = pda(["fill_commit", M]);
   const FO = pda(["fill_outbox", M]);
-  await send(l1, await program.methods.initializeMarket(refParams, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+  await send(l1, await program.methods.initializeMarket(refParams, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
   await send(l1, await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction(), []);
   await send(l1, await program.methods.initFillCommitment(CAP).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction(), []);
   await send(l1, await program.methods.initFillOutbox().accountsPartial({ authority: signer.publicKey, market: M, fillOutbox: FO, fillCommitment: FC, systemProgram: sys }).instruction(), []);
@@ -185,9 +185,9 @@ async function buildMarket(refParams) {
 }
 
 const restBidIx = (mkt, tick) =>
-  program.methods.placeLimitOrderV2(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: mkt.M, marketBook: mkt.BOOK, traderState: makerTS, position: null }).instruction();
+  program.methods.placeLimitOrder(0, new BN(1), new BN(tick), 0, new BN(0), 0).accountsPartial({ trader: maker.publicKey, market: mkt.M, marketBook: mkt.BOOK, traderState: makerTS, position: null }).instruction();
 const takerSweepIx = (mkt) =>
-  program.methods.placeTakerOrderV2(1, new BN(4), new BN(1), 0, new BN(0), 0)
+  program.methods.placeTakerOrder(1, new BN(4), new BN(1), 0, new BN(0), 0)
     .accountsPartial({ trader: taker.publicKey, market: mkt.M, marketBook: mkt.BOOK, traderState: takerTS, position: null })
     .remainingAccounts([{ pubkey: mkt.FC, isWritable: true, isSigner: false }, { pubkey: mkt.FO, isWritable: true, isSigner: false }]).instruction();
 const strictWithdrawIx = (amount) =>

@@ -1,6 +1,6 @@
 //! Exercises the *release path* end-to-end at the algorithmic layer:
 //!
-//!   trader gain credited to collateral (legacy flow)
+//!   trader gain credited to collateral (baseline flow)
 //!     → release_gain_to_haircut moves credit into reserve
 //!     → mature_position drains reserve → matured
 //!     → convert_position credits collateral at current h

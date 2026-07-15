@@ -501,21 +501,21 @@ mod tests {
             }
         }
 
-        /// M1 REGRESSION — funding is independent of the (caller-chosen) settle
+        /// Funding regression guard — funding is independent of the (caller-chosen) settle
         /// time/mark. In the price-weighted design `funding_owed` takes SIZE, not
         /// a settle-time notional, so a long and short of equal size over the same
-        /// index window net to EXACTLY zero no matter at what marks (m1, m2) each
+        /// index window net to EXACTLY zero no matter at what marks each
         /// leg is settled. The OLD design multiplied a dimensionless index by
-        /// `size·mark·tick` at settle time, so settling the long at m1 and the
-        /// short at m2 left a residue `∝ (m1 − m2)` — the value a delta-neutral
+        /// `size·mark·tick` at settle time, so differing settlement marks left a
+        /// residue — the value a delta-neutral
         /// trader extracted from the residual. Reconstructing that old formula
         /// here shows it was NOT zero-sum, while the new `funding_owed` is.
         #[test]
         fn funding_zero_sum_across_differing_settle_marks(
             size in 1u64..=1_000_000u64,
             idx in (1i128 << 20)..=(1i128 << 48),
-            m1 in 1u64..=1_000_000u64,
-            m2 in 1u64..=1_000_000u64,
+            long_mark in 1u64..=1_000_000u64,
+            short_mark in 1u64..=1_000_000u64,
             tick in 1u64..=1_000u64,
         ) {
             // NEW: settle-mark-independent, exactly zero-sum.
@@ -524,11 +524,11 @@ mod tests {
             prop_assert_eq!(long + short, 0);
 
             // OLD (reconstructed): dimensionless index × settle-time notional.
-            // With m1 != m2 and a material index this leaves a non-zero residue —
+            // With differing marks and a material index this leaves a non-zero residue —
             // the extraction. (Same shift on both sides for a fair comparison.)
-            let old_long = ((size as i128 * m1 as i128 * tick as i128) * idx) >> 16;
-            let old_short = -(((size as i128 * m2 as i128 * tick as i128) * idx) >> 16);
-            if m1 != m2 {
+            let old_long = ((size as i128 * long_mark as i128 * tick as i128) * idx) >> 16;
+            let old_short = -(((size as i128 * short_mark as i128 * tick as i128) * idx) >> 16);
+            if long_mark != short_mark {
                 prop_assert_ne!(
                     old_long + old_short,
                     0,

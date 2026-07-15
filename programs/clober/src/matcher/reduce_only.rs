@@ -3,7 +3,7 @@
 //! When set, the order can ONLY reduce or close an existing position
 //! on the configured side — it cannot open a new position or flip
 //! the side. Critical for protective stops and take-profits placed
-//! as limits (existing trigger v3 already has this; here we add it
+//! as limits (existing trigger per-market already has this; here we add it
 //! to plain limit orders).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

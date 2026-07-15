@@ -63,7 +63,7 @@ pub struct MarketSnapshot {
     /// concentration_threshold_lots` use `maintenance_margin_bps +
     /// concentration_extra_mmr_bps` as their effective MMR. Penalises
     /// whales whose size is harder to liquidate without market impact.
-    /// 0 threshold = tier disabled (legacy single-mmr behaviour).
+    /// 0 threshold = tier disabled (default single-mmr behaviour).
     pub concentration_threshold_lots: u64,
     pub concentration_extra_mmr_bps: u32,
     // ─── OI-scaled MMR inputs ────────────────────────────────────────
@@ -77,7 +77,7 @@ pub struct MarketSnapshot {
     /// Cap on the OI-scaled extra. Default 0 (no cap) = relies on the
     /// natural saturation of u32 bps. Production should set non-zero.
     pub oi_mmr_max_extra_bps: u32,
-    /// 3.1 percolator per-domain credit: paper-profit haircut in bps for THIS
+    /// Paper-profit haircut in bps for this
     /// market. Usable positive unrealized PnL is scaled by
     /// `(BPS_DENOM − paper_profit_haircut_bps)/BPS_DENOM` — i.e. `BPS_DENOM −
     /// credit_rate`. `0` = no haircut (full paper profit usable, default).
@@ -88,7 +88,7 @@ pub struct MarketSnapshot {
     /// Phase 1 per-market calibrated stress shock (bps). Every default_scenarios
     /// shock applied to THIS market is scaled by `scale_shock(base, this)` so a
     /// lower-vol asset is stress-tested to a smaller move (→ higher leverage).
-    /// `0` ⇒ legacy ±30% (full-strength lattice) — FAIL-SAFE: a forgotten/legacy
+    /// `0` ⇒ default ±30% (full-strength lattice) — FAIL-SAFE: a forgotten/default
     /// snapshot is stressed at full strength, never zero. Populate from
     /// `MarketAccount::stress_shock_bps` (raw; the scaler resolves 0 → 3000).
     pub stress_shock_bps: u32,
@@ -260,8 +260,8 @@ mod stress_scaler_tests {
     use super::*;
 
     #[test]
-    fn scale_shock_legacy_is_identity() {
-        // eff 0 ⇒ legacy 3000 ⇒ identity; eff == 3000 ⇒ identity too.
+    fn scale_shock_baseline_is_identity() {
+        // eff 0 ⇒ default 3000 ⇒ identity; eff == 3000 ⇒ identity too.
         for &b in &[-3000i32, -2000, -200, 0, 200, 2000, 3000] {
             assert_eq!(scale_shock(b, 0), b, "eff=0 must be full-strength identity");
             assert_eq!(scale_shock(b, 3000), b, "eff=3000 must be identity");
@@ -637,7 +637,7 @@ fn shocked_price(price: Ticks, shock_bps: i32) -> Result<Ticks> {
 /// Division-free NUMERATOR of the per-market stress scaler: `base_bps ·
 /// eff_shock_bps` in i64 (no divide). Factored out so the monotonicity of the
 /// scaled shock in `eff_shock_bps` is Kani-provable over the whole domain,
-/// sidestepping the non-power-of-2 `/ LEGACY_STRESS_SHOCK_BPS` divide CBMC
+/// sidestepping the non-power-of-2 `/ BASELINE_STRESS_SHOCK_BPS` divide CBMC
 /// cannot discharge (same discipline as `notional_exceeds_effective_cap`). The
 /// divide (order-preserving, positive constant) is applied in [`scale_shock`]
 /// and pinned end-to-end by the host test `scale_shock_is_monotone_grid`.
@@ -647,8 +647,8 @@ fn scale_shock_num(base_bps: i32, eff_shock_bps: u32) -> i64 {
 }
 
 /// Scale a base default-lattice shock to a market's calibrated stress tier:
-/// `scaled = base_bps · eff / LEGACY_STRESS_SHOCK_BPS`, where `eff` is the
-/// market's effective stress shock (`0` ⇒ legacy 3000, so an un-tiered/forgotten
+/// `scaled = base_bps · eff / BASELINE_STRESS_SHOCK_BPS`, where `eff` is the
+/// market's effective stress shock (`0` ⇒ default 3000, so an un-tiered/forgotten
 /// market is stressed at FULL strength — fail-safe, never zero-stress). The
 /// magnitude scales linearly with `eff`: a smaller tier ⇒ smaller stress ⇒
 /// LOWER required margin ⇒ higher permissible leverage; a larger tier ⇒ strictly
@@ -657,12 +657,12 @@ fn scale_shock_num(base_bps: i32, eff_shock_bps: u32) -> i64 {
 #[inline]
 fn scale_shock(base_bps: i32, eff_shock_bps: u32) -> i32 {
     let eff = if eff_shock_bps == 0 {
-        crate::constants::LEGACY_STRESS_SHOCK_BPS
+        crate::constants::BASELINE_STRESS_SHOCK_BPS
     } else {
         eff_shock_bps
     };
     let scaled =
-        scale_shock_num(base_bps, eff) / (crate::constants::LEGACY_STRESS_SHOCK_BPS as i64);
+        scale_shock_num(base_bps, eff) / (crate::constants::BASELINE_STRESS_SHOCK_BPS as i64);
     scaled.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
@@ -776,7 +776,7 @@ pub fn assess_margin(
                 None => continue,
             };
             // Phase 1: scale the base-lattice shock to THIS market's calibrated
-            // stress tier. `m.stress_shock_bps == 0` ⇒ full ±30% (legacy,
+            // stress tier. `m.stress_shock_bps == 0` ⇒ full ±30% (default,
             // fail-safe). A tighter (larger) tier ⇒ strictly larger scaled shock
             // ⇒ strictly higher required margin (monotone, proven).
             let shock = scale_shock(shock_for_market(scenario, &pos.market), m.stress_shock_bps);
@@ -844,7 +844,7 @@ pub fn assess_margin(
     // Because relief_G ≤ min(D_G,U_G), required ≥ Σ_G max(D_G,U_G) ≥ Σ_G |D_G−U_G|
     // = the fully-correlated joint worst — ONE-SIDED SOUND (never below the true
     // correlated worst-case) while ≤ the decorrelated sum. group 0 / rho 0 ⇒ no
-    // offset (byte-identical to legacy).
+    // offset (byte-identical to default).
     let mut decorr: u64 = 0;
     // Active correlation groups: (group_id, D, U, rho_min).
     let mut groups: Vec<(u16, u64, u64, u16)> = Vec::new();
@@ -1163,7 +1163,7 @@ mod fee_tier_tests {
 
     #[test]
     fn picks_highest_satisfied_tier() {
-        // HL-style schedule (monotone improving):
+        // Monotone tier schedule (monotone improving):
         //   tier 0 (vol 0):       maker 2 bps rebate, taker 5 bps fee
         //   tier 1 ($1M):         maker 3 bps rebate, taker 4 bps fee
         //   tier 2 ($5M):         maker 4 bps rebate, taker 3 bps fee
@@ -1459,7 +1459,7 @@ mod mmr_kani_proofs {
     /// a larger effective shock never yields a smaller-magnitude scaled shock, so
     /// a tighter (higher-vol) tier can only RAISE required margin, never lower it
     /// below the true worst case (Law 4, one-sided sound). Proven division-free on
-    /// the numerator; the ÷LEGACY_STRESS_SHOCK_BPS is a positive constant
+    /// the numerator; the ÷BASELINE_STRESS_SHOCK_BPS is a positive constant
     /// (order-preserving) pinned end-to-end by `scale_shock_is_monotone_grid`.
     // NOTE: monotonicity of the stress scaler is `|base·e1| <= |base·e2|` for
     // `e1 <= e2` — a comparison of TWO symbolic products. CBMC bit-blasts a
@@ -1481,7 +1481,7 @@ mod mmr_kani_proofs {
         assert!(extra <= max);
     }
 
-    /// slope == 0 fully DISABLES the surcharge (legacy / opt-in behaviour).
+    /// slope == 0 fully DISABLES the surcharge (default / opt-in behaviour).
     #[kani::proof]
     fn oi_scaled_zero_slope_disables() {
         let oi: u64 = kani::any();
@@ -1489,7 +1489,7 @@ mod mmr_kani_proofs {
         assert!(oi_scaled_mmr_extra_bps(oi, 0, max) == 0);
     }
 
-    /// INV-M4: the effective maintenance margin is NEVER below the base
+    /// The effective maintenance margin is never below the base
     /// floor — the concentration and OI surcharges only ADD (saturating),
     /// so no input can under-margin a position below `maintenance_margin_bps`.
     /// Proven on the live per-position MMR path used by `assess_margin`.
@@ -1772,9 +1772,9 @@ mod assess_margin_gate_kani_proofs {
         // The gate takes no mark-PnL argument at all, so its verdict cannot depend
         // on it — the proof witnesses that the fixed signature excludes the frame
         // that caused the double-count.
-        let (h1, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
-        let (h2, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
-        assert_eq!(h1, h2);
+        let (first_verdict, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        let (second_verdict, _) = gate(collateral, funding, pnl_stressed, mm_stressed);
+        assert_eq!(first_verdict, second_verdict);
     }
 }
 
@@ -2038,7 +2038,7 @@ mod high1_cross_market_regression {
     }
 
     #[test]
-    fn single_market_matches_legacy_frame() {
+    fn single_market_matches_baseline_frame() {
         // One market, one scenario: decomposition is byte-identical to the old
         // computation. (Mirrors assess_margin_frame_tests direction 1.)
         let m = market(1, 130);

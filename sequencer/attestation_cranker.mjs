@@ -8,7 +8,7 @@
 // resting-order initial margin, and attests any change on L1 — bounding the
 // documented attestation-lag window to roughly one poll interval.
 //
-// Reservation policy (v2): a trader's reservation is the sum of
+// Reservation policy (native): a trader's reservation is the sum of
 //     im = ceil(size_lots × price_ticks × tick_size × initial_margin_ratio_bps / 10_000)
 // over (a) every RESTING order on the book, and (b) every UNSETTLED fill —
 // outbox rows at absolute indices [ring.settled, ring.produced), reserved for
@@ -68,7 +68,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 // Account layout: [8B disc][256B header][N × 96B RBNode slab].
 // Header (offsets within the 256B header): bids_root u32 @104, asks_root @112.
 // RBNode (offsets within a 96B node): left u32 @0, right u32 @4, then the
-// 80B RestingOrderV2 payload @16: price_ticks u64 @32-16, size_lots u64 @40-16,
+// 80B RestingOrder payload @16: price_ticks u64 @32-16, size_lots u64 @40-16,
 // trader Pubkey @56-16, side u8 @92-16, sub_index u8 @95-16 (node-relative:
 // price @32, size @40, trader @56, side @92, sub_index @95).
 const MARKET_BOOK_DISC = Buffer.from([0xfb, 0xba, 0x00, 0x4b, 0x4d, 0x4b, 0x42, 0x01]);

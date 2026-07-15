@@ -39,7 +39,7 @@ pub struct SessionTokenAccount {
     /// Unix seconds after which the session is invalid (checked on every use).
     pub expires_at_unix: i64,
     /// Market scope. `Pubkey::default()` (all-zero) = the
-    /// session may act on ANY market (legacy/opt-out behaviour). A specific market
+    /// session may act on ANY market (default/opt-out behaviour). A specific market
     /// key = the session is restricted to that ONE market, so a leaked session key
     /// cannot dump the owner's collateral across every market. Enforced in `verify`.
     pub scope_market: Pubkey,

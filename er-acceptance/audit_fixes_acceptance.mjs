@@ -1,6 +1,5 @@
-// AUDIT-FIXES LIVE ACCEPTANCE (devnet) — validates the 2026-07 adversarial-audit
-// remediation on the real chain, end-to-end. Requires the post-remediation program
-// deployed (the added intake accounts + gates). Run AFTER `solana program deploy`.
+// LIVE ACCEPTANCE (devnet) — validates the critical intake, settlement, and
+// governance controls on the current Clober deployment, end-to-end.
 //
 //   C-1 (CRITICAL): a taker/maker order committed against a NON-EXISTENT TraderState
 //                   must be REJECTED at intake (pre-fix it settled → permanent FIFO
@@ -30,14 +29,14 @@ const program = new Program(IDL, new AnchorProvider(l1, new Wallet(signer), { co
 const sys = SystemProgram.programId;
 const pda = (s, p = PID) => PublicKey.findProgramAddressSync(s.map((x) => (Buffer.isBuffer(x) ? x : (typeof x === "string" ? Buffer.from(x) : x.toBuffer()))), p)[0];
 
-// Reference devnet accounts (shared across the acceptance suite).
-const QUOTE = new PublicKey("CJKxS7WBFaEoZkEBxd8kgWPtVShvTAfZswx4oFwGtQL3");
-const INS = new PublicKey("6GwRAhhTJG5M6tLa4s7yWjCriStuD3NrF3eqaBCD74FF");
-const VAULT = new PublicKey("Dqc79x21BmbdFNXXP9ZsPKpC6sUAm2cR2wovyQkroeYc");
-const OBV = new PublicKey("5zJhoFomJRC3xoC7Kj33owGtVQ8t23wMAPLEjcgz8EhD");
-const OOR = new PublicKey("8pRrwZ9knaCbbqDbPew28Tv965gxvfT2y9JKoUc3CnFH");
+// Current-program devnet fixture shared across the acceptance suite.
+const QUOTE = new PublicKey("5NL1XQZ4ZdiLR6a6VwCZWQ6DMCLdafCvbDFjeVRzcama");
+const INS = new PublicKey("B9MgERuAheDM3pzh3Z4VwYMZxSGpMmYATfjpuutpgAVJ");
+const VAULT = new PublicKey("2FNwaiQ1u5aJLbHviSch2p3pBVmnyMJK54v1cVtMuPVd");
+const OBV = new PublicKey("Cbf3TwLKvHsh1mH72PjNt7z7dpmbtxdYZNTWxybyde22");
+const OOR = new PublicKey("GebX5o8WUFLoJrMMGK1LjSBSCiSD3LZeRa248arggvDD");
 const LP = pda(["lp_exposure"]);
-const REF_MARKET = new PublicKey("3UWaYaqCkEsyhx5mQ9XWKsrRcqXZ736dBK7KK9oeU66q");
+const REF_MARKET = new PublicKey("DRTiohFdhTbyCHkc8huNMSgrgV3oDryayJHEavB5vztZ");
 
 // TraderState PDA: sub_index 0 = [b"trader_state", trader]; N>0 = [.., trader, [N]].
 const traderStatePda = (trader, sub = 0) =>
@@ -68,17 +67,15 @@ const mkMarket = async (params, tag) => {
   const M = pda(["market", base.publicKey, QUOTE]);
   const BOOK = pda(["market_book", M]);
   const FC = pda(["fill_commit", M]);
-  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), [base]);
+  await send(await program.methods.initializeMarket(params, new BN(100000)).accountsPartial({ authority: signer.publicKey, baseMint: base.publicKey, quoteMint: QUOTE, baseVault: OBV, quoteVault: VAULT, oracleAccount: OOR, market: M, insuranceFund: INS, lpExposure: LP, systemProgram: sys }).instruction(), []);
   await send(await program.methods.initMarketBook().accountsPartial({ authority: signer.publicKey, market: M, marketBook: BOOK, systemProgram: sys }).instruction());
   await send(await program.methods.initFillCommitment(256).accountsPartial({ authority: signer.publicKey, market: M, fillCommitment: FC, systemProgram: sys }).instruction());
   console.log(`  ${tag} market ${M.toBase58()}`);
   return { M, BOOK, FC };
 };
 
-// NOTE: the reference market was created under the OLD program with
-// oracle_staleness_max_seconds == 0; the post-remediation program REJECTS that
-// (AUDIT M-5 — a 0 bound silently disables the staleness gate). Supply a valid
-// bound. (This rejection is itself a live M-5 acceptance — see below.)
+// Keep a positive staleness window in the derived test parameters. A zero bound
+// disables the oracle-freshness gate and is rejected by current initialization.
 const paramsIM0 = { ...ref.params, initialMarginRatioBps: 0, oracleStalenessMaxSeconds: new BN(60) };
 const paramsIM = { ...ref.params, oracleStalenessMaxSeconds: new BN(60) };
 
@@ -94,7 +91,7 @@ ok(!!(await l1.getAccountInfo(TS0)), `TraderState(sub 0) exists ${TS0.toBase58()
 
 // Helper: place a taker order, supplying trader_state + (optional) position.
 const placeTaker = (mkt, sub, ts, { position = null, size = 1, price = 100000, side = 0, trader = signer.publicKey } = {}) =>
-  program.methods.placeTakerOrderV2(side, new BN(size), new BN(price), 0, new BN(0), sub)
+  program.methods.placeTakerOrder(side, new BN(size), new BN(price), 0, new BN(0), sub)
     .accountsPartial({ trader, market: mkt.M, marketBook: mkt.BOOK, traderState: ts, position })
     .remainingAccounts([{ pubkey: mkt.FC, isWritable: true, isSigner: false }])
     .instruction();
@@ -129,25 +126,25 @@ ok(Number(ts2info.collateralQuoteLots) === 0, `  precondition: fresh TraderState
 const m2rej = await sendExpectFail(await placeTaker(imM, 0, TS2, { trader: t2.publicKey }), [t2]);
 ok(m2rej, "M-2: zero-collateral open on an initial-margin market is REJECTED (free-option closed)");
 
-// ── F-1 (CRITICAL): vault_place_order_v3 must REQUIRE the vault's TraderState ────
+// ── F-1 (CRITICAL): vault_place_order must REQUIRE the vault's TraderState ────
 // Pre-fix a vault could rest a maker order under (vault_pk,0) with NO TraderState;
 // a taker crossing it committed a fill that could NEVER settle (apply_fill hard-
 // loads the maker TraderState) → permanent FIFO wedge, brickable by any user for
-// rent (create_vault_v3 is permissionless). Post-fix vault_trader_state is a
-// required, PDA-checked account on VaultPlaceOrderV3, so a vault order is
+// rent (create_vault is permissionless). Post-fix vault_trader_state is a
+// required, PDA-checked account on VaultPlaceOrder, so a vault order is
 // structurally unable to rest against a non-existent TraderState.
 console.log("\nF-1: vault order requires the vault's TraderState (anti-wedge, CRITICAL)");
 const vaultId = 1 + Math.floor(Math.random() * 250);
-const vaultPda = pda(["vault_v3", signer.publicKey, Buffer.from([vaultId])]);
-try { await send(await program.methods.createVaultV3(vaultId, Array(32).fill(0), 0).accountsPartial({ strategist: signer.publicKey, vault: vaultPda, systemProgram: sys }).instruction()); } catch (e) {}
+const vaultPda = pda(["vault", signer.publicKey, Buffer.from([vaultId])]);
+try { await send(await program.methods.createVault(vaultId, Array(32).fill(0), 0).accountsPartial({ strategist: signer.publicKey, vault: vaultPda, systemProgram: sys }).instruction()); } catch (e) {}
 ok(!!(await l1.getAccountInfo(vaultPda)), `  vault created ${vaultPda.toBase58().slice(0, 8)}…`);
 const vaultTs = pda(["trader_state", vaultPda]);
 ok(!(await l1.getAccountInfo(vaultTs)), "  precondition: vault TraderState does NOT exist yet");
-const vaultPlace = () => program.methods.vaultPlaceOrderV3(1, new BN(1), new BN(100000), 0, new BN(0))
+const vaultPlace = () => program.methods.vaultPlaceOrder(1, new BN(1), new BN(100000), 0, new BN(0))
   .accountsPartial({ strategist: signer.publicKey, vault: vaultPda, market: im0.M, marketBook: im0.BOOK, vaultTraderState: vaultTs }).instruction();
 const f1neg = await sendExpectFail(await vaultPlace());
 ok(f1neg, "F-1: vault order with a NON-EXISTENT vault TraderState is REJECTED (wedge closed)");
-await send(await program.methods.vaultOpenTraderStateV3().accountsPartial({ strategist: signer.publicKey, vault: vaultPda, vaultTraderState: vaultTs, systemProgram: sys }).instruction());
+await send(await program.methods.vaultOpenTraderState().accountsPartial({ strategist: signer.publicKey, vault: vaultPda, vaultTraderState: vaultTs, systemProgram: sys }).instruction());
 const f1sig = await send(await vaultPlace());
 ok(!!f1sig, `F-1: vault order WITH a real vault TraderState is ACCEPTED — ${String(f1sig).slice(0, 12)}… (no false-reject)`);
 
