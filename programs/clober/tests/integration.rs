@@ -2437,7 +2437,7 @@ async fn d19_reconciler_rebuilds_positions_and_oi_from_a_fill() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 2,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -7443,7 +7443,7 @@ async fn apply_fill_opens_both_positions_and_moves_oi() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 2,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // sequencer
@@ -7972,7 +7972,7 @@ async fn apply_fill_rejects_unauthorized_sequencer() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 3,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(rogue.pubkey(), true), // rogue, NOT market.sequencer
@@ -10493,7 +10493,7 @@ async fn partial_withdraw_rejects_omitted_position() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 4,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true), // payer IS market.sequencer
@@ -11437,7 +11437,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 5,
+            fill_seq: 1,
         },
         fill_metas(open_ring),
     );
@@ -11487,7 +11487,7 @@ async fn cu_benchmark_settlement_and_risk_paths() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 6,
+            fill_seq: 2,
         },
         fill_metas(close_ring),
     );
@@ -11657,7 +11657,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 7,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -11726,7 +11726,7 @@ async fn apply_fill_materialises_realized_pnl_on_winning_close() {
             taker_was_jit: false,
             taker_sub_index: 0,
             maker_sub_index: 0,
-            fill_seq: 8,
+            fill_seq: 2,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -11849,7 +11849,7 @@ async fn apply_fill_rejects_wrong_sub_index_trader_state() {
             taker_was_jit: false,
             taker_sub_index: 0, // ← lying: actually passing sub_state
             maker_sub_index: 0,
-            fill_seq: 9,
+            fill_seq: 1,
         },
         vec![
             AccountMeta::new(payer.pubkey(), true),
