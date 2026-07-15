@@ -199,8 +199,10 @@ toward decentralized sequencing: `docs/DECENTRALIZED_SEQUENCER.md`.
 
 Fill *authenticity* is enforced on L1 by the commitment ring; fill
 *ordering and liveness* rest on a single sequencer per market, bounded by
-the force-undelegate escapes and the oracle-pinned mark. This boundary is
-stated precisely in `ER_TRUST_BOUNDARY.md` and `SECURITY.md`.
+the oracle-pinned mark and an implemented force-undelegation gate. The
+deployed delegation program still requires sequencer cooperation for the
+actual exit operation. This boundary is stated precisely in
+`ER_TRUST_BOUNDARY.md` and `SECURITY.md`.
 
 ## Source layout
 
