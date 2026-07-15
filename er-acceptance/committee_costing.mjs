@@ -81,13 +81,6 @@ for (const N of [1, 4, 7, 10, 13]) {
   }
 }
 
-// slash_equivocation cost (2 sigs)
-try {
-  const comm = await program.account.sequencerCommittee.fetch(COMM);
-  const epoch = Number(comm.epoch);
-  const val = Keypair.fromSecretKey(new Uint8Array(64)); // placeholder — recompute below
-} catch {}
-
 console.log("");
 if (rows.length) {
   const base1 = rows[0].commitCU;
