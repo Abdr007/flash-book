@@ -17742,7 +17742,7 @@ async fn g3_oi_insurance_breaker_trips_and_pauses() {
         maker_state,
         1,       // size_lots
         100_000, // price_ticks == mark
-        2,       // fill_seq
+        1,       // first settlement sequence
     )
     .await;
 
@@ -17859,7 +17859,7 @@ async fn g3_oi_insurance_breaker_disabled_no_pause() {
         maker_state,
         1,
         100_000,
-        2,
+        1,
     )
     .await;
 
@@ -18050,7 +18050,7 @@ async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
         maker_state,
         1,
         100_000,
-        2,
+        1,
     )
     .await;
 
@@ -18123,7 +18123,7 @@ async fn g3_oi_insurance_floor_prevents_bootstrap_brick() {
         maker2_state,
         1,
         100_000,
-        3,
+        2,
     )
     .await;
     let market: MarketAccount = fetch(&mut ctx.banks_client, market_pda).await;
