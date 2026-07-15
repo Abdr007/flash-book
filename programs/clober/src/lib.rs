@@ -7117,10 +7117,11 @@ pub mod clober {
         Ok(())
     }
 
-    /// Clear the `book_delegated` flag once the market's book is back on L1
-    /// (undelegated). Authority-gated. Until called, the flag stays `true` and
-    /// order placement keeps requiring the armed lock — fail closed, never a
-    /// fund risk, only an over-requirement of arming while stale.
+    /// Return a market to its L1 close-out mode after its book is back under the
+    /// program. The book must be empty: otherwise an owner could withdraw after
+    /// the ER reservation is disarmed while a pre-existing opening order still
+    /// rests on L1. The explicit CloseOnly transition keeps the fallback usable
+    /// for reducing risk without ever admitting new unreserved exposure.
     pub fn clear_book_delegation(ctx: Context<ClearBookDelegation>) -> Result<()> {
         require_keys_eq!(
             ctx.accounts.market.authority,
@@ -7133,7 +7134,23 @@ pub mod clober {
             *ctx.program_id,
             CloberError::AlreadyDelegated
         );
+        {
+            let mut data = ctx.accounts.market_book.try_borrow_mut_data()?;
+            let handle = book_state::MarketBookHandle::from_account_data(&mut data)?;
+            require_keys_eq!(
+                handle.header.market_pubkey,
+                ctx.accounts.market.key(),
+                CloberError::WrongMarket
+            );
+            require!(
+                handle.header.total_orders_active == 0
+                    && handle.header.bids_root_index == crate::hypertree::NIL
+                    && handle.header.asks_root_index == crate::hypertree::NIL,
+                CloberError::L1FallbackRequiresEmptyBook
+            );
+        }
         ctx.accounts.market.book_delegated = false;
+        ctx.accounts.market.status = MarketStatus::CloseOnly as u8;
         // Reset the delegation liveness baseline so a later quiet period on the
         // now-L1 book cannot make `force_undelegate_allowed` fire off a stale
         // baseline (defense-in-depth; the `book_delegated` gate is authoritative).

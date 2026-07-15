@@ -1891,10 +1891,11 @@
     {
       "name": "clear_book_delegation",
       "docs": [
-        "Clear the `book_delegated` flag once the market's book is back on L1",
-        "(undelegated). Authority-gated. Until called, the flag stays `true` and",
-        "order placement keeps requiring the armed lock — fail closed, never a",
-        "fund risk, only an over-requirement of arming while stale."
+        "Return a market to its L1 close-out mode after its book is back under the",
+        "program. The book must be empty: otherwise an owner could withdraw after",
+        "the ER reservation is disarmed while a pre-existing opening order still",
+        "rests on L1. The explicit CloseOnly transition keeps the fallback usable",
+        "for reducing risk without ever admitting new unreserved exposure."
       ],
       "discriminator": [
         155,
@@ -20700,6 +20701,11 @@
       "code": 8327,
       "name": "OrderNotionalTooSmall",
       "msg": "Order notional (size × price × tick_size) is below the market's minimum (anti-dust floor)"
+    },
+    {
+      "code": 8328,
+      "name": "L1FallbackRequiresEmptyBook",
+      "msg": "Returning a market book to L1 requires an empty book; cancel or settle every resting order first"
     }
   ],
   "types": [

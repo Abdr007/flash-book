@@ -295,6 +295,8 @@ pub enum CloberError {
         "Order notional (size × price × tick_size) is below the market's minimum (anti-dust floor)"
     )]
     OrderNotionalTooSmall = 2327,
+    #[msg("Returning a market book to L1 requires an empty book; cancel or settle every resting order first")]
+    L1FallbackRequiresEmptyBook = 2328,
 }
 
 /// Convenience trait: `result.or_overflow()` to map None → ArithmeticOverflow.
